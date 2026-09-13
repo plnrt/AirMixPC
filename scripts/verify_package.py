@@ -23,9 +23,9 @@ usp10.dll uxtheme.dll version.dll winhttp.dll wininet.dll winmm.dll
 winspool.drv wintrust.dll ws2_32.dll wsock32.dll wtsapi32.dll
 """.split())
 REQUIRED = (
-    "uxplay.exe", "UxPlayEnhanced.exe", "xvidcore.dll", "LICENSE", "README.md",
-    "UxPlayEnhanced-Setup.cmd", "UxPlayEnhanced-Setup.ps1", "setup-firewall.ps1",
-    "UxPlayEnhanced-Uninstall.ps1",
+    "uxplay.exe", "AirMixPC.exe", "xvidcore.dll", "LICENSE", "README.md",
+    "THIRD_PARTY_NOTICES.md", "SOURCE_REVISIONS.txt",
+    "AirMixPC-Setup.cmd", "AirMixPC-Setup.ps1", "AirMixPC-Uninstall.ps1",
     *(f"lib/gstreamer-1.0/{name}.dll" for name in (
         "libgstcoreelements", "libgstapp", "libgstaudioconvert",
         "libgstaudioresample", "libgstlibav", "libgstwasapi",

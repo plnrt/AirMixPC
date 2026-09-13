@@ -11,6 +11,8 @@ import os
 cmake_path = os.path.join("lib", "uxplay", "lib", "CMakeLists.txt")
 uxplay_path = os.path.join("lib", "uxplay", "uxplay.cpp")
 raop_rtp_path = os.path.join("lib", "uxplay", "lib", "raop_rtp.c")
+raop_buffer_path = os.path.join("lib", "uxplay", "lib", "raop_buffer.c")
+raop_buffer_header_path = os.path.join("lib", "uxplay", "lib", "raop_buffer.h")
 audio_renderer_path = os.path.join("lib", "uxplay", "renderers", "audio_renderer.c")
 
 with open(cmake_path, "r") as f:
@@ -318,12 +320,157 @@ if 'LOGGER_INFO, "audio session ended"' not in raop_rtp_content:
 with open(raop_rtp_path, "w") as f:
     f.write(raop_rtp_content)
 
-# 7. Windows commonly converts the 44.1 kHz AirPlay stream to a 48 kHz output
+# 7. Emit machine-readable packet-health counters for the tray Auto mode.
+with open(raop_buffer_header_path, "r") as f:
+    buffer_header = f.read()
+if "raop_buffer_stats_t" not in buffer_header:
+    anchor = "typedef struct raop_buffer_s raop_buffer_t;\n"
+    addition = anchor + """
+typedef struct {
+    uint64_t received;
+    uint64_t missing;
+    uint64_t late;
+    uint64_t flushes;
+} raop_buffer_stats_t;
+"""
+    buffer_header = buffer_header.replace(anchor, addition, 1)
+    buffer_header = buffer_header.replace(
+        "void raop_buffer_flush(raop_buffer_t *raop_buffer, int next_seq);",
+        "void raop_buffer_flush(raop_buffer_t *raop_buffer, int next_seq);\n"
+        "void raop_buffer_get_stats(raop_buffer_t *raop_buffer, raop_buffer_stats_t *stats);",
+        1,
+    )
+with open(raop_buffer_header_path, "w") as f:
+    f.write(buffer_header)
+
+with open(raop_buffer_path, "r") as f:
+    buffer_source = f.read()
+if "raop_buffer_stats_t stats;" not in buffer_source:
+    buffer_source = buffer_source.replace(
+        "    raop_buffer_entry_t entries[RAOP_BUFFER_LENGTH];\n};",
+        "    raop_buffer_entry_t entries[RAOP_BUFFER_LENGTH];\n    raop_buffer_stats_t stats;\n};",
+        1,
+    )
+    buffer_source = buffer_source.replace(
+        "    /* If this packet is too late, just skip it */\n"
+        "    if (!raop_buffer->is_empty && seqnum_cmp(seqnum, raop_buffer->first_seqnum) < 0) {",
+        "    /* If this packet is too late, just skip it */\n"
+        "    if (!raop_buffer->is_empty && seqnum_cmp(seqnum, raop_buffer->first_seqnum) < 0) {\n"
+        "        raop_buffer->stats.late++;",
+        1,
+    )
+    buffer_source = buffer_source.replace(
+        "    /* Update the raop_buffer entry header */",
+        "    raop_buffer->stats.received++;\n\n    /* Update the raop_buffer entry header */",
+        1,
+    )
+    buffer_source = buffer_source.replace(
+        "        if (count){\n            resend_cb(opaque, raop_buffer->first_seqnum, count);",
+        "        if (count){\n            raop_buffer->stats.missing += count;\n"
+        "            resend_cb(opaque, raop_buffer->first_seqnum, count);",
+        1,
+    )
+    buffer_source = buffer_source.replace(
+        "void raop_buffer_flush(raop_buffer_t *raop_buffer, int next_seq) {\n    assert(raop_buffer);",
+        "void raop_buffer_flush(raop_buffer_t *raop_buffer, int next_seq) {\n"
+        "    assert(raop_buffer);\n    raop_buffer->stats.flushes++;",
+        1,
+    )
+    buffer_source += """
+
+void raop_buffer_get_stats(raop_buffer_t *raop_buffer, raop_buffer_stats_t *stats) {
+    assert(raop_buffer);
+    assert(stats);
+    *stats = raop_buffer->stats;
+}
+"""
+with open(raop_buffer_path, "w") as f:
+    f.write(buffer_source)
+
+with open(raop_rtp_path, "r") as f:
+    raop_rtp_content = f.read()
+if "airmix_retransmitted" not in raop_rtp_content:
+    anchor = "    while(1) {\n"
+    raop_rtp_content = raop_rtp_content.replace(
+        anchor,
+        "    uint64_t airmix_retransmitted = 0;\n"
+        "    uint64_t airmix_last_report = 0;\n" + anchor,
+        1,
+    )
+    raop_rtp_content = raop_rtp_content.replace(
+        "                    int result = raop_buffer_enqueue(raop_rtp->buffer, resent_packet, resent_packetlen, 1);",
+        "                    airmix_retransmitted++;\n"
+        "                    int result = raop_buffer_enqueue(raop_rtp->buffer, resent_packet, resent_packetlen, 1);",
+        1,
+    )
+    anchor = "            int result = raop_buffer_enqueue(raop_rtp->buffer, packet, packetlen, 1);\n            assert(result >= 0);"
+    addition = anchor + """
+            raop_buffer_stats_t airmix_stats;
+            raop_buffer_get_stats(raop_rtp->buffer, &airmix_stats);
+            if (airmix_stats.received - airmix_last_report >= 512) {
+                logger_log(raop_rtp->logger, LOGGER_INFO,
+                           "AIRMIX_METRIC received=%llu missing=%llu retransmitted=%llu late=%llu flushes=%llu decoder_errors=0 sink_errors=0",
+                           (unsigned long long) airmix_stats.received,
+                           (unsigned long long) airmix_stats.missing,
+                           (unsigned long long) airmix_retransmitted,
+                           (unsigned long long) airmix_stats.late,
+                           (unsigned long long) airmix_stats.flushes);
+                airmix_last_report = airmix_stats.received;
+            }
+"""
+    raop_rtp_content = raop_rtp_content.replace(anchor, addition, 1)
+    anchor = '    logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp exiting thread");'
+    final = """    raop_buffer_stats_t airmix_stats;
+    raop_buffer_get_stats(raop_rtp->buffer, &airmix_stats);
+    logger_log(raop_rtp->logger, LOGGER_INFO,
+               "AIRMIX_METRIC received=%llu missing=%llu retransmitted=%llu late=%llu flushes=%llu decoder_errors=0 sink_errors=0",
+               (unsigned long long) airmix_stats.received,
+               (unsigned long long) airmix_stats.missing,
+               (unsigned long long) airmix_retransmitted,
+               (unsigned long long) airmix_stats.late,
+               (unsigned long long) airmix_stats.flushes);
+    logger_log(raop_rtp->logger, LOGGER_INFO, "AIRMIX_EVENT disconnect reason=ended");
+""" + anchor
+    raop_rtp_content = raop_rtp_content.replace(anchor, final, 1)
+with open(raop_rtp_path, "w") as f:
+    f.write(raop_rtp_content)
+
+if 'AIRMIX_EVENT disconnect reason=network' not in uxplay_content:
+    uxplay_content = uxplay_content.replace(
+        'LOGI("***ERROR lost connection with client (network problem?)");',
+        'LOGI("***ERROR lost connection with client (network problem?)");\n'
+        '            LOGI("AIRMIX_EVENT disconnect reason=network");',
+    )
+    uxplay_content = uxplay_content.replace(
+        'LOGI("*** ERROR lost connection with client (network problem?)");',
+        'LOGI("*** ERROR lost connection with client (network problem?)");\n'
+        '        LOGI("AIRMIX_EVENT disconnect reason=network");',
+    )
+    with open(uxplay_path, "w") as f:
+        f.write(uxplay_content)
+
+# 8. Windows commonly converts the 44.1 kHz AirPlay stream to a 48 kHz output
 # device. GStreamer's quality 10 adds about 2.18 ms of resampler latency and
 # roughly doubles this stage's CPU cost versus the default quality 4, but the
 # measured real-time cost remained about 0.22% of one core on the build PC.
 with open(audio_renderer_path, "r") as f:
     audio_renderer_content = f.read()
+
+if 'AIRMIX_EVENT error type=decoder reason=audio_error' not in audio_renderer_content:
+    audio_renderer_content = audio_renderer_content.replace(
+        'logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", renderer->ct);',
+        'logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", renderer->ct);\n'
+        '        logger_log(logger, LOGGER_INFO, "AIRMIX_EVENT error type=decoder reason=audio_error count=1");',
+        1,
+    )
+
+if 'AIRMIX_EVENT error type=sink reason=audio_error' not in audio_renderer_content:
+    audio_renderer_content = audio_renderer_content.replace(
+        'logger_log(logger, LOGGER_INFO, "GStreamer error (audio): %s %s", GST_MESSAGE_SRC_NAME(message),err->message);',
+        'logger_log(logger, LOGGER_INFO, "GStreamer error (audio): %s %s", GST_MESSAGE_SRC_NAME(message),err->message);\n'
+        '        logger_log(logger, LOGGER_INFO, "AIRMIX_EVENT error type=sink reason=audio_error count=1");',
+        1,
+    )
 
 if "audioresample quality=10 !" not in audio_renderer_content:
     old_resampler = '        g_string_append (launch, "audioresample ! ");    /* wasapisink must resample from 44.1 kHz to 48 kHz */\n'

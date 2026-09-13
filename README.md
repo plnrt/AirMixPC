@@ -1,4 +1,34 @@
-# UxPlayEnhanced
+# AirMix PC
+
+AirMix PC is a GPLv3 Windows tray receiver that brings iPhone audio to the
+current Windows default output over AirPlay/Wi-Fi. Windows mixes that stream
+with PC audio, so both are heard through devices such as the WH-1000XM6.
+
+Version 1 is intentionally audio-only (`-vs 0`): screen mirroring, video and
+FairPlay DRM playback are outside its scope. It uses `wasapi2sink` in shared
+mode and follows the Windows default endpoint. Auto mode starts with a 0.5 s
+buffer and promotes the next controlled AirPlay connection to Stable (2 s)
+after repeated packet loss, late packets, buffer flushes, or disconnects.
+
+Settings, pairing state, private key, and rotating logs live under
+`%LOCALAPPDATA%\AirMixPC`. The installer restricts that directory to the
+current user and SYSTEM, creates Private-network-only program firewall rules,
+and marks the known `admin_new` and `admin_new_5g` profiles Private.
+
+Build from an MSYS2 MinGW64 shell with `./build.sh`, then compile the normal
+Windows installer with `installer\build-installer.ps1`. Run
+`dist\installer\AirMixPC-Setup-1.0.0.exe` to install. The modern wizard offers
+Ukrainian and English UI, startup and desktop-shortcut choices, and caches a
+repair launcher in the Start menu. Windows Installed Apps provides normal
+uninstall. Uninstall does not touch Bluetooth Audio Receiver, Phone Link, or
+device drivers, and preserves AirMix pairing/settings.
+
+Pinned upstream source revisions:
+
+- UxPlayEnhanced: `77b88a7b05c67c7d4a388d2fe8fe15c8078b564d`
+- UxPlay: `5de48c3d7ba07de396639dd3704de908b649f37f`
+
+## Upstream project notes
 
 **A lightweight, audio-only, Bonjour-free UxPlay distribution for Windows.**
 

@@ -20,9 +20,9 @@ class PackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.fixture(root)
-            (root / 'UxPlayEnhanced.exe').unlink()
+            (root / 'AirMixPC.exe').unlink()
             with patch.object(package, 'imports', return_value=set()):
-                with self.assertRaisesRegex(RuntimeError, 'Missing required file: UxPlayEnhanced.exe'):
+                with self.assertRaisesRegex(RuntimeError, 'Missing required file: AirMixPC.exe'):
                     package.verify(root)
 
     def test_missing_transitive_dll_and_runtime_resolution(self):

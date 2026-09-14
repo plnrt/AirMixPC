@@ -48,7 +48,10 @@ receiver core and disconnects every connected device. AirPlay volume is
 tracked per device, while the overall output volume stays a single, shared
 Windows setting. Losing the connection to one device only ends that
 device's session; the others keep playing. The tray window and menu list
-every currently connected device.
+every currently connected device. This per-device isolation applies once
+`maxClients` is above 1; with the default single-client behavior
+(`maxClients` set to 1), a lost connection is still reported and handled as
+a process-wide event, exactly as in earlier single-device releases.
 
 ## Upstream project notes
 

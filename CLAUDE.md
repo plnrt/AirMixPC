@@ -112,17 +112,24 @@ AIRMIX_EVENT disconnect sid=1 reason=network
 
 Rules for anyone touching this boundary:
 
-- `sid=` is always the first key on every line, including when only one
-  device is connected (there is no legacy no-`sid` form).
+- `sid=` is always the first key on `AIRMIX_EVENT start`/`error` and every
+  `AIRMIX_METRIC` line, including when only one device is connected.
+- One exception, kept byte-identical to upstream on purpose: when
+  `maxClients` is 1 (or `-maxclients` is omitted), the single-client
+  feedback-timeout path in `feedback_callback` still prints the legacy
+  `AIRMIX_EVENT disconnect reason=network` with **no** `sid`. This is a
+  process-wide event (the whole receiver is about to reset), not a
+  per-device one, and the multi-session (`maxClients > 1`) feedback-timeout
+  and sink/decoder-error paths always include `sid=` instead.
 - Existing keys (`received`, `missing`, `type`, `reason`, …) are never
   renamed; new fields are only ever appended.
 - `device` and `model` are percent-encoded byte-for-byte (everything outside
   `[A-Za-z0-9._~-]` becomes `%XX` over UTF-8); the Python side decodes with
   `launcher/airmix_core.py`'s `decode_field` (`urllib.parse.unquote`, where
   `+` is not treated as a space).
-- A `disconnect` line with no `sid` (for example the tray's own
-  `disconnect reason=unexpected`) is process-wide and clears the entire
-  session registry, not just one device.
+- A `disconnect` line with no `sid` (the legacy `reason=network` line above,
+  or the tray's own `disconnect reason=unexpected`) is process-wide and
+  clears the entire session registry, not just one device.
 
 On the Python side, `launcher/airmix_core.py` owns a `SessionRegistry`
 (`SessionState` per `sid`, keyed by `sid`, exposing `apply`, `lines()`,

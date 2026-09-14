@@ -595,94 +595,202 @@ def setup(icon):
     if not UI_TEST_MODE:
         start_uxplay()
         if not REGISTER_PATH.exists():
-            icon.notify(f"Select AirMix PC on iPhone. First-time PIN: {settings['pairingPin']}", core.APP_NAME)
+            icon.notify(f"Select AirMix PC on your iPhone or iPad. First-time PIN: {settings['pairingPin']}", core.APP_NAME)
     threading.Thread(target=monitor_loop, args=(icon,), daemon=True).start()
+
+
+PALETTE = {
+    "bg": "#0f141d", "card": "#182130", "field": "#222e41", "line": "#26334a",
+    "text": "#eef3fa", "muted": "#8ea3bb", "accent": "#3b82f6", "accent_active": "#2f6fd6",
+    "ok": "#34d399", "warn": "#fbbf24", "error": "#f87171", "idle": "#6b7a90",
+}
+METRIC_KEYS = ("received", "missing", "retransmitted", "late", "flushes")
+
+
+def enable_dpi_awareness():
+    """Render crisp text on scaled displays instead of letting Windows stretch a 96-DPI bitmap."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
 
 
 class AirMixWindow:
     def __init__(self, icon):
         self.icon = icon
+        enable_dpi_awareness()
         self.root = tk.Tk()
+        self.scale = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
         self.root.title(f"{core.APP_NAME} v{core.APP_VERSION}")
-        self.root.geometry("720x590")
-        self.root.minsize(620, 520)
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
-        self.root.configure(bg="#10151f")
+        self.root.configure(bg=PALETTE["bg"])
         try:
             self.root.iconbitmap(resource_path("assets", "UxPlayEnhanced.ico"))
         except tk.TclError:
             pass
-        self.values = {key: tk.StringVar() for key in (
-            "status", "client", "song", "quality", "output", "metrics", "pin")}
+        self.values = {key: tk.StringVar() for key in ("status", "song", "quality", "output", "pin", "device_count")}
+        self.metric_values = {key: tk.StringVar(value="0") for key in METRIC_KEYS}
         self.mode = tk.StringVar(value=core.MODE_LABELS[settings["mode"]])
         self.receiver_name = tk.StringVar(value=settings["receiverName"])
         self.launch_at_login = tk.BooleanVar(value=settings["launchAtLogin"])
+        self.rendered_devices = None
         self._build()
         self.refresh()
+        self._fit_to_content(force=True)
+
+    def px(self, value):
+        return int(round(value * self.scale))
 
     def _build(self):
+        c = PALETTE
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure("TFrame", background="#10151f")
-        style.configure("Card.TFrame", background="#192231")
-        style.configure("TLabel", background="#10151f", foreground="#dce7f5", font=("Segoe UI", 10))
+        style.configure(".", background=c["bg"], foreground=c["text"], font=("Segoe UI", 10), borderwidth=0)
+        style.configure("TFrame", background=c["bg"])
+        style.configure("Card.TFrame", background=c["card"])
+        style.configure("TLabel", background=c["bg"], foreground=c["text"], font=("Segoe UI", 10))
         style.configure("Header.TLabel", foreground="#ffffff", font=("Segoe UI Semibold", 24))
-        style.configure("Sub.TLabel", foreground="#8ea3bb", font=("Segoe UI", 10))
-        style.configure("CardTitle.TLabel", background="#192231", foreground="#8ea3bb", font=("Segoe UI Semibold", 9))
-        style.configure("CardValue.TLabel", background="#192231", foreground="#f5f8fc", font=("Segoe UI Semibold", 12))
-        style.configure("Accent.TButton", font=("Segoe UI Semibold", 10), padding=(16, 9))
-        style.configure("TButton", font=("Segoe UI", 10), padding=(12, 8))
-        style.configure("TCheckbutton", background="#10151f", foreground="#dce7f5")
+        style.configure("Sub.TLabel", foreground=c["muted"], font=("Segoe UI", 10))
+        style.configure("CardTitle.TLabel", background=c["card"], foreground=c["muted"], font=("Segoe UI Semibold", 9))
+        style.configure("CardValue.TLabel", background=c["card"], foreground=c["text"], font=("Segoe UI Semibold", 12))
+        style.configure("CardMuted.TLabel", background=c["card"], foreground=c["muted"], font=("Segoe UI", 10))
+        style.configure("Device.TLabel", background=c["card"], foreground=c["text"], font=("Segoe UI Semibold", 12))
+        style.configure("Metric.TLabel", background=c["card"], foreground=c["text"], font=("Segoe UI Semibold", 15))
+        style.configure("MetricName.TLabel", background=c["card"], foreground=c["muted"], font=("Segoe UI", 9))
+        style.configure("TButton", background=c["field"], foreground=c["text"], font=("Segoe UI", 10),
+                        padding=(14, 8), borderwidth=0, focuscolor=c["field"])
+        style.map("TButton", background=[("active", c["line"]), ("disabled", c["card"])],
+                  foreground=[("disabled", c["idle"])])
+        style.configure("Accent.TButton", background=c["accent"], foreground="#ffffff",
+                        font=("Segoe UI Semibold", 10), padding=(18, 8), borderwidth=0, focuscolor=c["accent"])
+        style.map("Accent.TButton", background=[("active", c["accent_active"]), ("disabled", c["idle"])])
+        style.configure("TCheckbutton", background=c["bg"], foreground=c["text"], focuscolor=c["bg"])
+        style.map("TCheckbutton", background=[("active", c["bg"])],
+                  indicatorcolor=[("selected", c["accent"]), ("!selected", c["field"])])
+        style.configure("TCombobox", fieldbackground=c["field"], background=c["field"], foreground=c["text"],
+                        arrowcolor=c["text"], bordercolor=c["field"], lightcolor=c["field"], darkcolor=c["field"],
+                        selectbackground=c["field"], selectforeground=c["text"], padding=(8, 6))
+        style.map("TCombobox", fieldbackground=[("readonly", c["field"])], foreground=[("readonly", c["text"])],
+                  selectbackground=[("readonly", c["field"])], selectforeground=[("readonly", c["text"])])
+        self.root.option_add("*TCombobox*Listbox.background", c["field"])
+        self.root.option_add("*TCombobox*Listbox.foreground", c["text"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", c["accent"])
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.root.option_add("*TCombobox*Listbox.font", "{Segoe UI} 10")
 
-        body = ttk.Frame(self.root, padding=24)
+        body = ttk.Frame(self.root, padding=self.px(24))
         body.pack(fill="both", expand=True)
-        top = ttk.Frame(body)
-        top.pack(fill="x")
-        ttk.Label(top, text="AirMix PC", style="Header.TLabel").pack(side="left")
-        ttk.Label(top, text="iPhone, iPad + Windows audio over Wi-Fi", style="Sub.TLabel").pack(side="left", padx=(14, 0), pady=(12, 0))
-        ttk.Label(top, text=f"v{core.APP_VERSION}", style="Sub.TLabel").pack(side="right", pady=(12, 0))
 
-        status = ttk.Frame(body, style="Card.TFrame", padding=18)
-        status.pack(fill="x", pady=(20, 10))
-        self._row(status, "RECEIVER", "status")
-        self._row(status, "DEVICES", "client")
-        self._row(status, "NOW PLAYING", "song")
-        self._row(status, "FORMAT", "quality")
+        header = ttk.Frame(body)
+        header.pack(fill="x")
+        titles = ttk.Frame(header)
+        titles.pack(side="left")
+        ttk.Label(titles, text="AirMix PC", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(titles, text="iPhone, iPad and Windows audio, mixed in your headphones",
+                  style="Sub.TLabel").pack(anchor="w")
+        badges = ttk.Frame(header)
+        badges.pack(side="right", anchor="n", pady=(self.px(6), 0))
+        self.status_badge = tk.Label(badges, textvariable=self.values["status"], bg=c["idle"], fg="#0b1020",
+                                     font=("Segoe UI Semibold", 10), padx=self.px(12), pady=self.px(4))
+        self.status_badge.pack(anchor="e")
+        ttk.Label(badges, text=f"v{core.APP_VERSION}", style="Sub.TLabel").pack(anchor="e", pady=(self.px(6), 0))
 
-        output = ttk.Frame(body, style="Card.TFrame", padding=18)
-        output.pack(fill="x", pady=10)
-        self._row(output, "WINDOWS OUTPUT", "output")
-        self._row(output, "PACKET HEALTH", "metrics")
+        devices = self._card(body, pady=(self.px(20), self.px(8)))
+        head = ttk.Frame(devices, style="Card.TFrame")
+        head.pack(fill="x")
+        ttk.Label(head, text="DEVICES", style="CardTitle.TLabel").pack(side="left")
+        ttk.Label(head, textvariable=self.values["device_count"], style="CardMuted.TLabel").pack(side="right")
+        self.devices_frame = ttk.Frame(devices, style="Card.TFrame")
+        self.devices_frame.pack(fill="x", pady=(self.px(8), 0))
+
+        playback = self._card(body)
+        self._row(playback, "NOW PLAYING", self.values["song"])
+        self._row(playback, "FORMAT", self.values["quality"])
+
+        output = self._card(body)
+        self._row(output, "WINDOWS OUTPUT", self.values["output"])
+        ttk.Label(output, text="PACKET HEALTH", style="CardTitle.TLabel").pack(anchor="w", pady=(self.px(10), self.px(4)))
+        metrics = ttk.Frame(output, style="Card.TFrame")
+        metrics.pack(fill="x")
+        for column, key in enumerate(METRIC_KEYS):
+            tile = ttk.Frame(metrics, style="Card.TFrame")
+            tile.grid(row=0, column=column, sticky="w", padx=(0, self.px(28)))
+            ttk.Label(tile, textvariable=self.metric_values[key], style="Metric.TLabel").pack(anchor="w")
+            ttk.Label(tile, text=key, style="MetricName.TLabel").pack(anchor="w")
 
         controls = ttk.Frame(body)
-        controls.pack(fill="x", pady=(12, 4))
-        ttk.Label(controls, text="Mode").grid(row=0, column=0, sticky="w")
-        combo = ttk.Combobox(controls, state="readonly", width=24, textvariable=self.mode,
+        controls.pack(fill="x", pady=(self.px(16), 0))
+        mode_box = ttk.Frame(controls)
+        mode_box.pack(side="left")
+        ttk.Label(mode_box, text="Audio mode", style="Sub.TLabel").pack(anchor="w")
+        combo = ttk.Combobox(mode_box, state="readonly", width=22, textvariable=self.mode,
                              values=[core.MODE_LABELS[m] for m in core.VALID_MODES])
-        combo.grid(row=1, column=0, sticky="w", pady=(5, 0))
+        combo.pack(anchor="w", pady=(self.px(4), 0))
         combo.bind("<<ComboboxSelected>>", self.change_mode)
-        ttk.Button(controls, text="Start", style="Accent.TButton", command=lambda: on_start(self.icon, None)).grid(row=1, column=1, padx=(18, 6), pady=(5, 0))
-        ttk.Button(controls, text="Stop", command=lambda: on_stop(self.icon, None)).grid(row=1, column=2, padx=6, pady=(5, 0))
-        ttk.Button(controls, text="Restart", command=lambda: on_restart(self.icon, None)).grid(row=1, column=3, padx=6, pady=(5, 0))
+        buttons = ttk.Frame(controls)
+        buttons.pack(side="right", anchor="s")
+        ttk.Button(buttons, text="Start", style="Accent.TButton",
+                   command=lambda: on_start(self.icon, None)).pack(side="left", padx=(0, self.px(8)))
+        ttk.Button(buttons, text="Stop", command=lambda: on_stop(self.icon, None)).pack(side="left", padx=(0, self.px(8)))
+        ttk.Button(buttons, text="Restart", command=lambda: on_restart(self.icon, None)).pack(side="left")
 
         pairing = ttk.Frame(body)
-        pairing.pack(fill="x", pady=(15, 4))
+        pairing.pack(fill="x", pady=(self.px(18), 0))
         ttk.Label(pairing, textvariable=self.values["pin"], font=("Segoe UI Semibold", 11)).pack(side="left")
-        ttk.Button(pairing, text="Reset trusted iPhone", command=lambda: reset_trust(self.icon, None)).pack(side="right")
+        ttk.Label(pairing, text="  Enter it on a new iPhone or iPad the first time it connects.",
+                  style="Sub.TLabel").pack(side="left")
+        ttk.Button(pairing, text="Reset trusted devices", command=lambda: reset_trust(self.icon, None)).pack(side="right")
 
-        bottom = ttk.Frame(body)
-        bottom.pack(fill="x", side="bottom", pady=(18, 0))
-        ttk.Checkbutton(bottom, text="Launch at sign-in", variable=self.launch_at_login,
+        footer = ttk.Frame(body)
+        footer.pack(fill="x", pady=(self.px(18), 0))
+        ttk.Checkbutton(footer, text="Launch at sign-in", variable=self.launch_at_login,
                         command=self.toggle_startup).pack(side="left")
-        ttk.Button(bottom, text="Logs", command=lambda: on_view_logs(self.icon, None)).pack(side="right", padx=(6, 0))
-        ttk.Button(bottom, text="Install folder", command=lambda: on_open_folder(self.icon, None)).pack(side="right", padx=(6, 0))
-        ttk.Label(body, text="Closing this window keeps AirMix PC running in the system tray.", style="Sub.TLabel").pack(side="bottom", anchor="w")
+        ttk.Button(footer, text="Logs", command=lambda: on_view_logs(self.icon, None)).pack(side="right", padx=(self.px(8), 0))
+        ttk.Button(footer, text="Install folder", command=lambda: on_open_folder(self.icon, None)).pack(side="right")
+        ttk.Label(body, text="Closing this window keeps AirMix PC running in the system tray.",
+                  style="Sub.TLabel").pack(anchor="w", pady=(self.px(12), 0))
+
+    def _card(self, parent, pady=None):
+        card = ttk.Frame(parent, style="Card.TFrame", padding=(self.px(18), self.px(16)))
+        card.pack(fill="x", pady=pady if pady is not None else (self.px(8), self.px(8)))
+        return card
 
     def _row(self, parent, title, variable):
         line = ttk.Frame(parent, style="Card.TFrame")
-        line.pack(fill="x", pady=4)
-        ttk.Label(line, text=title, style="CardTitle.TLabel", width=18).pack(side="left")
-        ttk.Label(line, textvariable=self.values[variable], style="CardValue.TLabel").pack(side="left", fill="x", expand=True)
+        line.pack(fill="x", pady=self.px(4))
+        ttk.Label(line, text=title, style="CardTitle.TLabel", width=18).pack(side="left", anchor="n", pady=(self.px(3), 0))
+        ttk.Label(line, textvariable=variable, style="CardValue.TLabel", wraplength=self.px(470),
+                  justify="left").pack(side="left", fill="x", expand=True)
+
+    def _render_devices(self, devices):
+        for child in self.devices_frame.winfo_children():
+            child.destroy()
+        if not devices:
+            ttk.Label(self.devices_frame, text="No devices connected", style="Device.TLabel").pack(anchor="w")
+            ttk.Label(self.devices_frame, text="Pick \u201cAirMix PC\u201d in the AirPlay menu on an iPhone or iPad.",
+                      style="CardMuted.TLabel").pack(anchor="w", pady=(self.px(2), 0))
+            return
+        for label, connected, error, codec in devices:
+            line = ttk.Frame(self.devices_frame, style="Card.TFrame")
+            line.pack(fill="x", pady=(0, self.px(6)))
+            color = PALETTE["error"] if error else (PALETTE["ok"] if connected else PALETTE["idle"])
+            tk.Label(line, text="\u25cf", fg=color, bg=PALETTE["card"], font=("Segoe UI", 12)).pack(side="left", padx=(0, self.px(8)))
+            ttk.Label(line, text=label, style="Device.TLabel").pack(side="left")
+            detail = "Audio error" if error else ("Playing" if connected else "Connected")
+            if codec:
+                detail += f"  \u00b7  {codec}"
+            ttk.Label(line, text=detail, style="CardMuted.TLabel").pack(side="left", padx=(self.px(12), 0), pady=(self.px(2), 0))
+
+    def _fit_to_content(self, force=False):
+        self.root.update_idletasks()
+        width = max(self.px(760), self.root.winfo_reqwidth())
+        height = self.root.winfo_reqheight()
+        if force or self.root.winfo_height() < height:
+            self.root.geometry(f"{width}x{height}")
+        self.root.minsize(width, height)
 
     def change_mode(self, event=None):
         selected = next(key for key, label in core.MODE_LABELS.items() if label == self.mode.get())
@@ -711,14 +819,29 @@ class AirMixWindow:
         state = read_state()
         with state_lock:
             running = process is not None and process.poll() is None
-        self.values["status"].set("Connected" if state["audio_connected"] else ("Waiting for AirPlay" if running else "Stopped"))
-        self.values["client"].set("\n".join(session_lines()) or "No devices connected")
+            devices = tuple((s.label(), s.connected, s.error, s.codec) for s in sessions.active())
+        if state["audio_error"] and not devices:
+            status, color = "Audio error", PALETTE["error"]
+        elif state["audio_connected"] or devices:
+            status, color = "Connected", PALETTE["ok"]
+        elif running:
+            status, color = "Waiting for AirPlay", PALETTE["warn"]
+        else:
+            status, color = "Stopped", PALETTE["idle"]
+        self.values["status"].set(status)
+        self.status_badge.configure(bg=color)
+        count = len(devices)
+        self.values["device_count"].set("" if not count else ("1 device" if count == 1 else f"{count} devices"))
+        if devices != self.rendered_devices:
+            self._render_devices(devices)
+            self.rendered_devices = devices
+            self._fit_to_content()
         self.values["song"].set(current_song(state))
         self.values["quality"].set(state["quality"] or "Waiting for audio")
         self.values["output"].set(state["output"])
         metric = state.get("metrics", {})
-        self.values["metrics"].set("received {received}  •  missing {missing}  •  retransmitted {retransmitted}  •  late {late}  •  flushes {flushes}".format(
-            **{key: metric.get(key, 0) for key in ("received", "missing", "retransmitted", "late", "flushes")}))
+        for key in METRIC_KEYS:
+            self.metric_values[key].set(str(metric.get(key, 0)))
         self.values["pin"].set(f"Pairing PIN: {settings['pairingPin']}")
         self.mode.set(core.MODE_LABELS[settings["mode"]])
         self.root.after(1000, self.refresh)
@@ -748,7 +871,7 @@ def run_tray():
             pystray.MenuItem("Stop receiver", on_stop, enabled=lambda item: receiver_enabled),
             pystray.MenuItem("Restart", on_restart, enabled=lambda item: receiver_enabled),
             pystray.MenuItem("Launch at sign-in", toggle_startup, checked=lambda item: settings["launchAtLogin"]),
-            pystray.MenuItem("Reset trusted iPhone", reset_trust),
+            pystray.MenuItem("Reset trusted devices", reset_trust),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("View logs", on_view_logs),
             pystray.MenuItem("Edit settings", on_open_settings),

@@ -129,6 +129,17 @@ def parse_fields(payload: str) -> dict[str, str]:
     return fields
 
 
+def decode_field(value: str) -> str:
+    return unquote(value)
+
+
+def session_id(payload: dict) -> int:
+    try:
+        return int(payload.get("sid", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def parse_telemetry(line: str) -> tuple[str, dict] | None:
     metric = METRIC_PATTERN.match(line.strip())
     if metric:

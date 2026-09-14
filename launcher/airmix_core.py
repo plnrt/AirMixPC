@@ -9,17 +9,22 @@ from pathlib import Path
 import re
 import secrets
 import time
+from urllib.parse import unquote
 
 
 APP_NAME = "AirMix PC"
 APP_VERSION = "1.0.2"
 APP_SLUG = "AirMixPC"
+DEFAULT_MAX_CLIENTS = 4
+MIN_CLIENTS = 1
+MAX_CLIENTS = 12
 DEFAULT_SETTINGS = {
     "receiverName": APP_NAME,
     "mode": "auto",
     "launchAtLogin": True,
     "followDefaultOutput": True,
     "pausePhoneLink": False,
+    "maxClients": DEFAULT_MAX_CLIENTS,
 }
 VALID_MODES = ("auto", "stable", "balanced", "lowLatency")
 MODE_LABELS = {
@@ -43,6 +48,25 @@ def generate_pin() -> str:
     return f"{secrets.randbelow(9000) + 1000:04d}"
 
 
+def normalize_max_clients(value) -> int:
+    if isinstance(value, bool):
+        return DEFAULT_MAX_CLIENTS
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str):
+        try:
+            number = int(value)
+        except ValueError:
+            return DEFAULT_MAX_CLIENTS
+    else:
+        return DEFAULT_MAX_CLIENTS
+    return max(MIN_CLIENTS, min(MAX_CLIENTS, number))
+
+
+def max_clients_arguments(max_clients: int) -> list[str]:
+    return ["-maxclients", str(max_clients)]
+
+
 def normalize_settings(raw: dict | None) -> dict:
     settings = dict(DEFAULT_SETTINGS)
     if isinstance(raw, dict):
@@ -55,6 +79,7 @@ def normalize_settings(raw: dict | None) -> dict:
     settings["receiverName"] = name[:64] or APP_NAME
     for key in ("launchAtLogin", "followDefaultOutput", "pausePhoneLink"):
         settings[key] = bool(settings[key])
+    settings["maxClients"] = normalize_max_clients(settings["maxClients"])
     pin = raw.get("pairingPin") if isinstance(raw, dict) else None
     settings["pairingPin"] = str(pin) if str(pin or "").isdigit() and len(str(pin)) == 4 else generate_pin()
     return settings

@@ -270,18 +270,19 @@ class AutoPolicy:
 
     now: callable = time.monotonic
     stable: bool = False
-    last_metrics: dict[str, int] | None = None
+    last_metrics: dict[int, dict[str, int]] = field(default_factory=dict)
     disconnects: list[float] = field(default_factory=list)
 
     def observe_metric(self, metric: dict) -> bool:
         if self.stable:
             return False
+        sid = session_id(metric)
         numeric = {key: int(metric.get(key, 0)) for key in ("received", "missing", "late", "flushes")}
-        if self.last_metrics is None:
-            self.last_metrics = numeric
+        baseline = self.last_metrics.get(sid)
+        self.last_metrics[sid] = numeric
+        if baseline is None:
             return False
-        delta = {key: max(0, numeric[key] - self.last_metrics.get(key, 0)) for key in numeric}
-        self.last_metrics = numeric
+        delta = {key: max(0, numeric[key] - baseline.get(key, 0)) for key in numeric}
         received = max(1, delta["received"])
         poor = delta["flushes"] >= 1 or delta["late"] >= 3 or delta["missing"] / received >= 0.01
         if poor:
@@ -299,5 +300,8 @@ class AutoPolicy:
             return True
         return False
 
-    def reset_session(self) -> None:
-        self.last_metrics = None
+    def reset_session(self, sid: int | None = None) -> None:
+        if sid is None:
+            self.last_metrics = {}
+        else:
+            self.last_metrics.pop(sid, None)

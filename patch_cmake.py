@@ -1520,4 +1520,320 @@ if "AIRMIX_EVENT start sid=" not in uxplay_content:
 with open(uxplay_path, "w") as f:
     f.write(uxplay_content)
 
+# 13. Adversarial-review hardening (fixes-adv.md F3, F4, F5, F6, F9):
+#  - a bad decoder frame is skipped, not treated as fatal for the session
+#    (only a sink/output failure disconnects it);
+#  - a feedback timeout for a connection that has not started audio yet
+#    (still pairing, or waiting on a PIN) gets a longer grace period before
+#    it is treated as lost;
+#  - the airmix_slot table and the metadata de-duplication cache each get
+#    their own mutex, since httpd/RTP threads and the GLib main-loop thread
+#    all touch them concurrently;
+#  - "-maxclients" without a following value reports an error instead of
+#    reading past the end of argv.
+with open(uxplay_path, "r") as f:
+    uxplay_content = f.read()
+
+if "option_has_value(i, argc, arg, argv[i+1])) exit(1);\n            unsigned int n = 12;" not in uxplay_content:
+    old = """        } else if (arg == "-maxclients") {
+            unsigned int n = 12;
+            if (!get_value(argv[++i], &n)) {
+                fprintf(stderr, "invalid \\"-maxclients %s\\"; -maxclients n : range [1,12]\\n", argv[i]);
+                exit(1);
+            }
+            max_clients = n;
+"""
+    new = """        } else if (arg == "-maxclients") {
+            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            unsigned int n = 12;
+            if (!get_value(argv[++i], &n)) {
+                fprintf(stderr, "invalid \\"-maxclients %s\\"; -maxclients n : range [1,12]\\n", argv[i]);
+                exit(1);
+            }
+            max_clients = n;
+"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find -maxclients option parsing to add the missing-value check")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if 'strcmp(type, "sink") == 0' not in uxplay_content:
+    old = """extern "C" void audio_renderer_error_callback(void *cls, unsigned int sid, const char *type) {
+    LOGI("AIRMIX_EVENT error sid=%u type=%s reason=audio_error count=1", sid, type);
+    raop_disconnect_connection(raop, cls);
+}
+"""
+    new = """extern "C" void audio_renderer_error_callback(void *cls, unsigned int sid, const char *type) {
+    LOGI("AIRMIX_EVENT error sid=%u type=%s reason=audio_error count=1", sid, type);
+    /* A single malformed decoder frame is skipped and playback continues,
+     * matching legacy single-client behavior; only a sink (output) failure
+     * ends the session. */
+    if (type && strcmp(type, "sink") == 0) {
+        raop_disconnect_connection(raop, cls);
+    }
+}
+"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find audio_renderer_error_callback to restrict disconnect to sink errors")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "#include <mutex>" not in uxplay_content:
+    anchor = "#include <string>\n"
+    if anchor not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find #include <string> to anchor #include <mutex>")
+    uxplay_content = uxplay_content.replace(anchor, anchor + "#include <mutex>\n", 1)
+
+if "static std::mutex airmix_slot_mutex;" not in uxplay_content:
+    anchor = "static airmix_slot airmix_slots[AIRMIX_MAX_SLOTS];\n"
+    if anchor not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find the airmix_slots table to add its mutex")
+    uxplay_content = uxplay_content.replace(anchor, anchor + "static std::mutex airmix_slot_mutex;\n", 1)
+
+if "airmix_slot_mutex.lock();\n    airmix_slot_claim(cls);" not in uxplay_content:
+    old = """extern "C" void conn_init (void *cls) {
+    open_connections++;
+    LOGD("Open connections: %i", open_connections);
+    airmix_slot_claim(cls);
+    //video_renderer_update_background(1);
+}
+"""
+    new = """extern "C" void conn_init (void *cls) {
+    open_connections++;
+    LOGD("Open connections: %i", open_connections);
+    airmix_slot_mutex.lock();
+    airmix_slot_claim(cls);
+    airmix_slot_mutex.unlock();
+    //video_renderer_update_background(1);
+}
+"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find conn_init to lock the airmix slot claim")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "airmix_slot_mutex.lock();\n    airmix_slot_release(cls);" not in uxplay_content:
+    old = """    if (use_audio) {
+        audio_renderer_stop(cls);
+        audio_renderer_destroy_session(cls);
+    }
+    airmix_slot_release(cls);
+"""
+    new = """    if (use_audio) {
+        audio_renderer_stop(cls);
+        audio_renderer_destroy_session(cls);
+    }
+    airmix_slot_mutex.lock();
+    airmix_slot_release(cls);
+    airmix_slot_mutex.unlock();
+"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find conn_destroy to lock the airmix slot release")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "airmix_slot_mutex.lock();\n    if (airmix_slot *slot = airmix_slot_find(cls)) {\n        slot->missed_feedback = 0;" not in uxplay_content:
+    old = """extern "C" void conn_feedback (void *cls) {
+    /* received client heartbeat signal: connection still exists */
+    if (airmix_slot *slot = airmix_slot_find(cls)) {
+        slot->missed_feedback = 0;
+    }
+    missed_feedback = 0;
+}
+"""
+    new = """extern "C" void conn_feedback (void *cls) {
+    /* received client heartbeat signal: connection still exists */
+    airmix_slot_mutex.lock();
+    if (airmix_slot *slot = airmix_slot_find(cls)) {
+        slot->missed_feedback = 0;
+    }
+    airmix_slot_mutex.unlock();
+    missed_feedback = 0;
+}
+"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find conn_feedback to lock the airmix slot reset")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "airmix_slot_mutex.lock();\n    if (airmix_slot *slot = airmix_slot_find(cls)) {\n        slot->device" not in uxplay_content:
+    old = """    if (airmix_slot *slot = airmix_slot_find(cls)) {
+        slot->device = name ? name : "";
+        slot->model = model ? model : "";
+    }
+"""
+    new = """    airmix_slot_mutex.lock();
+    if (airmix_slot *slot = airmix_slot_find(cls)) {
+        slot->device = name ? name : "";
+        slot->model = model ? model : "";
+    }
+    airmix_slot_mutex.unlock();
+"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find report_client_request to lock the airmix slot device/model update")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "airmix_slot_mutex.lock();\n        airmix_slot *slot = airmix_slot_find(cls);" not in uxplay_content:
+    old = """    if (use_audio) {
+        airmix_slot *slot = airmix_slot_find(cls);
+        uint64_t clock_offset = slot ? slot->clock_offset : 0;
+        if (!clock_offset) {
+            uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
+            clock_offset = local_time - data->ntp_time_remote;
+            if (slot) slot->clock_offset = clock_offset;
+        }
+        data->ntp_time_remote = data->ntp_time_remote + clock_offset;
+        switch (data->ct) {
+"""
+    new = """    if (use_audio) {
+        airmix_slot_mutex.lock();
+        airmix_slot *slot = airmix_slot_find(cls);
+        uint64_t clock_offset = slot ? slot->clock_offset : 0;
+        if (!clock_offset) {
+            uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
+            clock_offset = local_time - data->ntp_time_remote;
+            if (slot) slot->clock_offset = clock_offset;
+        }
+        airmix_slot_mutex.unlock();
+        data->ntp_time_remote = data->ntp_time_remote + clock_offset;
+        switch (data->ct) {
+"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find audio_process's clock-offset logic to lock the airmix slot read")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "airmix_slot_mutex.lock();\n    if (airmix_slot *slot = airmix_slot_find(cls)) {\n        slot->clock_offset = 0;" not in uxplay_content:
+    old = """    /* Reset the stream-local clock mapping before the first frame. */
+    if (airmix_slot *slot = airmix_slot_find(cls)) {
+        slot->clock_offset = 0;
+        slot->audio_started = true;
+    }
+"""
+    new = """    /* Reset the stream-local clock mapping before the first frame. */
+    airmix_slot_mutex.lock();
+    if (airmix_slot *slot = airmix_slot_find(cls)) {
+        slot->clock_offset = 0;
+        slot->audio_started = true;
+    }
+    airmix_slot_mutex.unlock();
+"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find audio_get_format's clock-offset reset to lock the airmix slot write")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "std::string started_device = started_slot" not in uxplay_content:
+    old = """    if (use_audio) {
+      audio_renderer_start(cls, raop_connection_id(cls), ct);
+      airmix_slot *started_slot = airmix_slot_find(cls);
+      LOGI("AIRMIX_EVENT start sid=%u device=%s model=%s codec=%s",
+           raop_connection_id(cls),
+           airmix_percent_encode(started_slot ? started_slot->device : "").c_str(),
+           airmix_percent_encode(started_slot ? started_slot->model : "").c_str(),
+           airmix_codec_name(*ct));
+    }
+"""
+    new = """    if (use_audio) {
+      audio_renderer_start(cls, raop_connection_id(cls), ct);
+      airmix_slot_mutex.lock();
+      airmix_slot *started_slot = airmix_slot_find(cls);
+      std::string started_device = started_slot ? started_slot->device : "";
+      std::string started_model = started_slot ? started_slot->model : "";
+      airmix_slot_mutex.unlock();
+      LOGI("AIRMIX_EVENT start sid=%u device=%s model=%s codec=%s",
+           raop_connection_id(cls),
+           airmix_percent_encode(started_device).c_str(),
+           airmix_percent_encode(started_model).c_str(),
+           airmix_codec_name(*ct));
+    }
+"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find audio_get_format's AIRMIX_EVENT start to copy slot fields under lock")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "airmix_timeout" not in uxplay_content:
+    old = """    } else if (missed_feedback_limit) {
+        for (int i = 0; i < AIRMIX_MAX_SLOTS; i++) {
+            airmix_slot *slot = &airmix_slots[i];
+            if (!slot->cls || !slot->audio_started) {
+                continue;
+            }
+            slot->missed_feedback++;
+            if (slot->missed_feedback > missed_feedback_limit) {
+                LOGI("AIRMIX_EVENT disconnect sid=%u reason=network", slot->sid);
+                raop_disconnect_connection(raop, slot->cls);
+                slot->audio_started = false;
+            }
+        }
+    }
+"""
+    new = """    } else if (missed_feedback_limit) {
+        /* A connection that has not started audio yet (still pairing, or
+         * waiting on a PIN) gets a longer grace period than a live session
+         * before it is treated as lost. Slots to disconnect are collected
+         * here and acted on after the lock is released, since
+         * raop_disconnect_connection() must not be called while holding
+         * airmix_slot_mutex. */
+        struct airmix_timeout { void *cls; unsigned int sid; };
+        airmix_timeout timed_out[AIRMIX_MAX_SLOTS];
+        int timed_out_count = 0;
+        airmix_slot_mutex.lock();
+        for (int i = 0; i < AIRMIX_MAX_SLOTS; i++) {
+            airmix_slot *slot = &airmix_slots[i];
+            if (!slot->cls) {
+                continue;
+            }
+            unsigned int limit = slot->audio_started ? missed_feedback_limit : (4 * missed_feedback_limit);
+            slot->missed_feedback++;
+            if (slot->missed_feedback > limit) {
+                timed_out[timed_out_count].cls = slot->cls;
+                timed_out[timed_out_count].sid = slot->sid;
+                timed_out_count++;
+                slot->audio_started = false;
+                slot->missed_feedback = 0;
+            }
+        }
+        airmix_slot_mutex.unlock();
+        for (int i = 0; i < timed_out_count; i++) {
+            LOGI("AIRMIX_EVENT disconnect sid=%u reason=network", timed_out[i].sid);
+            raop_disconnect_connection(raop, timed_out[i].cls);
+        }
+    }
+"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find feedback_callback's multi-session branch to add slot locking and longer timeouts for pending sessions")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "static std::mutex airmix_metadata_mutex;" not in uxplay_content:
+    anchor = 'static std::string last_audio_metadata_text = "";\n'
+    if anchor not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find last_audio_metadata_text to add its mutex")
+    uxplay_content = uxplay_content.replace(anchor, anchor + "static std::mutex airmix_metadata_mutex;\n", 1)
+
+if "airmix_metadata_mutex.lock();\n    last_audio_metadata_text.clear();" not in uxplay_content:
+    old = "    last_audio_metadata_text.clear();\n"
+    new = """    airmix_metadata_mutex.lock();
+    last_audio_metadata_text.clear();
+    airmix_metadata_mutex.unlock();
+"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find last_audio_metadata_text.clear() to lock it")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "airmix_metadata_mutex.lock();\n    if (!metadata_text.empty()" not in uxplay_content:
+    old = """    if (!metadata_text.empty() && metadata_text != last_audio_metadata_text) {
+        printf("====================Audio Metadata==================\\n");
+        LOGI("%s", metadata_text.c_str());
+        last_audio_metadata_text = metadata_text;
+    }
+"""
+    new = """    airmix_metadata_mutex.lock();
+    if (!metadata_text.empty() && metadata_text != last_audio_metadata_text) {
+        printf("====================Audio Metadata==================\\n");
+        LOGI("%s", metadata_text.c_str());
+        last_audio_metadata_text = metadata_text;
+    }
+    airmix_metadata_mutex.unlock();
+"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find the metadata de-duplication check to lock it")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+with open(uxplay_path, "w") as f:
+    f.write(uxplay_content)
+
 print(f"Patched {cmake_path}")

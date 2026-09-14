@@ -454,38 +454,15 @@ if 'AIRMIX_EVENT disconnect reason=network' not in uxplay_content:
     with open(uxplay_path, "w") as f:
         f.write(uxplay_content)
 
-# 8. Windows commonly converts the 44.1 kHz AirPlay stream to a 48 kHz output
-# device. GStreamer's quality 10 adds about 2.18 ms of resampler latency and
-# roughly doubles this stage's CPU cost versus the default quality 4, but the
-# measured real-time cost remained about 0.22% of one core on the build PC.
+# 8. renderers/audio_renderer.c is no longer string-patched: build.sh copies
+# AirMix PC's own src/audio_renderer.c/.h (per-session pipelines, D4) over the
+# upstream file before this script runs. Fail loudly if that copy is missing,
+# rather than silently keeping a stale single-session renderer.
 with open(audio_renderer_path, "r") as f:
     audio_renderer_content = f.read()
 
-if 'AIRMIX_EVENT error type=decoder reason=audio_error' not in audio_renderer_content:
-    audio_renderer_content = audio_renderer_content.replace(
-        'logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", renderer->ct);',
-        'logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", renderer->ct);\n'
-        '        logger_log(logger, LOGGER_INFO, "AIRMIX_EVENT error type=decoder reason=audio_error count=1");',
-        1,
-    )
-
-if 'AIRMIX_EVENT error type=sink reason=audio_error' not in audio_renderer_content:
-    audio_renderer_content = audio_renderer_content.replace(
-        'logger_log(logger, LOGGER_INFO, "GStreamer error (audio): %s %s", GST_MESSAGE_SRC_NAME(message),err->message);',
-        'logger_log(logger, LOGGER_INFO, "GStreamer error (audio): %s %s", GST_MESSAGE_SRC_NAME(message),err->message);\n'
-        '        logger_log(logger, LOGGER_INFO, "AIRMIX_EVENT error type=sink reason=audio_error count=1");',
-        1,
-    )
-
-if "audioresample quality=10 !" not in audio_renderer_content:
-    old_resampler = '        g_string_append (launch, "audioresample ! ");    /* wasapisink must resample from 44.1 kHz to 48 kHz */\n'
-    new_resampler = '        g_string_append (launch, "audioresample quality=10 ! ");    /* high-quality 44.1 kHz to 48 kHz conversion */\n'
-    if old_resampler not in audio_renderer_content:
-        raise RuntimeError("Could not find UxPlay audio resampler insertion point")
-    audio_renderer_content = audio_renderer_content.replace(old_resampler, new_resampler, 1)
-
-with open(audio_renderer_path, "w") as f:
-    f.write(audio_renderer_content)
+if "audio_renderer_session_count" not in audio_renderer_content:
+    raise RuntimeError("audio_renderer.c replacement missing; run build.sh")
 
 # 9. Multi-session admission control: per-connection session ids, a
 # connection-count admission check keyed off raop->max_raop_clients, and an
@@ -900,6 +877,287 @@ if "raop_set_max_clients(raop, max_clients);" not in uxplay_content:
     uxplay_content = uxplay_content.replace(
         anchor, anchor + "    raop_set_max_clients(raop, max_clients);\n", 1
     )
+
+with open(uxplay_path, "w") as f:
+    f.write(uxplay_content)
+
+# 10. Per-session audio renderer routing (D4/D5): a fixed slot table keyed by
+# the opaque raop connection pointer (the "cls" every raop callback already
+# carries) tracks per-session clock offset, feedback timeouts, and device
+# info, and every audio_renderer_* call site is threaded with cls so each
+# AirPlay session gets its own GStreamer pipeline.
+with open(uxplay_path, "r") as f:
+    uxplay_content = f.read()
+
+if "airmix_slot_claim" not in uxplay_content:
+    old_conn = """extern "C" void conn_init (void *cls) {
+    open_connections++;
+    LOGD("Open connections: %i", open_connections);
+    //video_renderer_update_background(1);
+}
+
+extern "C" void conn_destroy (void *cls) {
+    //video_renderer_update_background(-1);
+    open_connections--;
+    LOGD("Open connections: %i", open_connections);
+    if (open_connections == 0) {
+        remote_clock_offset = 0;
+        if (use_audio) {
+            audio_renderer_stop();
+        }
+        if (dacpfile.length()) {
+            remove (dacpfile.c_str());
+        }
+        if (mux_to_file) {
+            mux_renderer_stop();
+        }
+    }
+}
+"""
+    new_conn = """#define AIRMIX_MAX_SLOTS 12   /* matches httpd.c's MAX_CONNECTIONS */
+struct airmix_slot {
+    void *cls;
+    unsigned int sid;
+    uint64_t clock_offset;
+    unsigned int missed_feedback;
+    bool audio_started;
+    std::string device;
+    std::string model;
+};
+static airmix_slot airmix_slots[AIRMIX_MAX_SLOTS];
+
+static airmix_slot *airmix_slot_find(void *cls) {
+    if (!cls) return NULL;
+    for (int i = 0; i < AIRMIX_MAX_SLOTS; i++) {
+        if (airmix_slots[i].cls == cls) return &airmix_slots[i];
+    }
+    return NULL;
+}
+
+static airmix_slot *airmix_slot_claim(void *cls) {
+    if (!cls) return NULL;
+    airmix_slot *slot = airmix_slot_find(cls);
+    if (slot) return slot;
+    for (int i = 0; i < AIRMIX_MAX_SLOTS; i++) {
+        if (airmix_slots[i].cls == NULL) {
+            airmix_slots[i] = airmix_slot();
+            airmix_slots[i].cls = cls;
+            airmix_slots[i].sid = raop_connection_id(cls);
+            return &airmix_slots[i];
+        }
+    }
+    return NULL;
+}
+
+static void airmix_slot_release(void *cls) {
+    airmix_slot *slot = airmix_slot_find(cls);
+    if (slot) {
+        *slot = airmix_slot();
+    }
+}
+
+extern "C" void conn_init (void *cls) {
+    open_connections++;
+    LOGD("Open connections: %i", open_connections);
+    airmix_slot_claim(cls);
+    //video_renderer_update_background(1);
+}
+
+extern "C" void conn_destroy (void *cls) {
+    //video_renderer_update_background(-1);
+    open_connections--;
+    LOGD("Open connections: %i", open_connections);
+    if (use_audio) {
+        audio_renderer_stop(cls);
+        audio_renderer_destroy_session(cls);
+    }
+    airmix_slot_release(cls);
+    if (open_connections == 0) {
+        remote_clock_offset = 0;
+        if (use_audio) {
+            audio_renderer_stop(NULL);
+        }
+        if (dacpfile.length()) {
+            remove (dacpfile.c_str());
+        }
+        if (mux_to_file) {
+            mux_renderer_stop();
+        }
+    }
+}
+"""
+    if old_conn not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find conn_init/conn_destroy to add the AirMix slot table")
+    uxplay_content = uxplay_content.replace(old_conn, new_conn, 1)
+
+if "airmix_slot *slot = airmix_slot_find(cls);\n        uint64_t clock_offset" not in uxplay_content:
+    old_audio_process = """    if (use_audio) {
+        if (!remote_clock_offset) {
+            uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
+            remote_clock_offset = local_time - data->ntp_time_remote;
+        }
+        data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
+        switch (data->ct) {
+"""
+    new_audio_process = """    if (use_audio) {
+        airmix_slot *slot = airmix_slot_find(cls);
+        uint64_t clock_offset = slot ? slot->clock_offset : 0;
+        if (!clock_offset) {
+            uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
+            clock_offset = local_time - data->ntp_time_remote;
+            if (slot) slot->clock_offset = clock_offset;
+        }
+        data->ntp_time_remote = data->ntp_time_remote + clock_offset;
+        switch (data->ct) {
+"""
+    if old_audio_process not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find audio_process clock-offset logic")
+    uxplay_content = uxplay_content.replace(old_audio_process, new_audio_process, 1)
+
+if "audio_renderer_render_buffer(cls," not in uxplay_content:
+    old = "        audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote));"
+    new = "        audio_renderer_render_buffer(cls, data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote));"
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find audio_renderer_render_buffer call")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "audio_renderer_flush(cls);" not in uxplay_content:
+    old = """extern "C" void audio_flush (void *cls) {
+    if (use_audio) {
+        audio_renderer_flush();
+    }
+}"""
+    new = """extern "C" void audio_flush (void *cls) {
+    if (use_audio) {
+        audio_renderer_flush(cls);
+    }
+}"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find audio_flush callback")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "audio_renderer_set_volume(cls, gst_volume);" not in uxplay_content:
+    old = "    audio_renderer_set_volume(gst_volume);"
+    new = "    audio_renderer_set_volume(cls, gst_volume);"
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find audio_renderer_set_volume call")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "airmix_slot_find(cls)) {\n        slot->clock_offset = 0;" not in uxplay_content:
+    old_get_format = """    audio_type = type;
+    /* Reset the stream-local clock mapping before the first frame. */
+    remote_clock_offset = 0;
+
+    if (use_audio) {
+      audio_renderer_start(ct);
+    }
+"""
+    new_get_format = """    audio_type = type;
+    /* Reset the stream-local clock mapping before the first frame. */
+    if (airmix_slot *slot = airmix_slot_find(cls)) {
+        slot->clock_offset = 0;
+        slot->audio_started = true;
+    }
+
+    if (use_audio) {
+      audio_renderer_start(cls, raop_connection_id(cls), ct);
+    }
+"""
+    if old_get_format not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find audio_get_format renderer-start logic")
+    uxplay_content = uxplay_content.replace(old_get_format, new_get_format, 1)
+
+if "audio_renderer_set_multi_session(max_clients > 1);" not in uxplay_content:
+    anchor = """    if (raop_init2(raop, nohold, mac_address.c_str(), keyfile.c_str())){
+        LOGE("Error initializing raop (2)!");
+        free (raop);
+        return -1;
+    }
+"""
+    if anchor not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find raop_init2 call in start_raop_server")
+    uxplay_content = uxplay_content.replace(
+        anchor, anchor + "    audio_renderer_set_multi_session(max_clients > 1);\n", 1
+    )
+
+if "audio_renderer_set_loop((void *) loop);" not in uxplay_content:
+    old_main_loop_top = """#define MAX_VIDEO_RENDERERS 3
+#define MAX_AUDIO_RENDERERS 2
+static void main_loop()  {
+    guint gst_video_bus_watch_id[MAX_VIDEO_RENDERERS] = { 0 };
+    guint gst_audio_bus_watch_id[MAX_AUDIO_RENDERERS] = { 0 };
+    GMainLoop *loop = g_main_loop_new(NULL,FALSE);
+"""
+    new_main_loop_top = """#define MAX_VIDEO_RENDERERS 3
+static void main_loop()  {
+    guint gst_video_bus_watch_id[MAX_VIDEO_RENDERERS] = { 0 };
+    GMainLoop *loop = g_main_loop_new(NULL,FALSE);
+"""
+    if old_main_loop_top not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find main_loop's audio/video bus watch declarations")
+    uxplay_content = uxplay_content.replace(old_main_loop_top, new_main_loop_top, 1)
+
+    old_n_reset = "    n_video_renderers = 0;\n    n_audio_renderers = 0;\n"
+    new_n_reset = "    n_video_renderers = 0;\n"
+    if old_n_reset not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find main_loop's renderer-count reset")
+    uxplay_content = uxplay_content.replace(old_n_reset, new_n_reset, 1)
+
+    old_audio_listen = """    if (use_audio) {
+        rtptime_start = 0;
+        rtptime_end = 0;
+        monitor_progress = true;
+        artist.erase();
+        coverart_artist.erase();
+        progress_id  = g_timeout_add_seconds(1,(GSourceFunc) progress_callback, (gpointer) loop);
+        n_audio_renderers = 2;
+        g_assert(n_audio_renderers <= MAX_AUDIO_RENDERERS);
+        for (int i = 0; i < n_audio_renderers; i++) {
+            gst_audio_bus_watch_id[i] = (guint) audio_renderer_listen((void *)loop, i);      
+        }
+    }
+"""
+    new_audio_listen = """    if (use_audio) {
+        rtptime_start = 0;
+        rtptime_end = 0;
+        monitor_progress = true;
+        artist.erase();
+        coverart_artist.erase();
+        progress_id  = g_timeout_add_seconds(1,(GSourceFunc) progress_callback, (gpointer) loop);
+        audio_renderer_set_loop((void *) loop);
+    }
+"""
+    if old_audio_listen not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find main_loop's audio bus-watch setup")
+    uxplay_content = uxplay_content.replace(old_audio_listen, new_audio_listen, 1)
+
+    old_audio_cleanup = """    for (int i = 0; i < n_audio_renderers; i++) {
+        if (gst_audio_bus_watch_id[i] > 0) g_source_remove(gst_audio_bus_watch_id[i]);
+    }
+"""
+    if old_audio_cleanup not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find main_loop's audio bus-watch cleanup")
+    uxplay_content = uxplay_content.replace(old_audio_cleanup, "", 1)
+
+    old_global = "static int n_audio_renderers = 0;\n"
+    if old_global not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find n_audio_renderers global declaration")
+    uxplay_content = uxplay_content.replace(old_global, "", 1)
+
+if "audio_renderer_stop(NULL);\n        }\n        if (use_video && (close_window" not in uxplay_content:
+    old = """        if (use_audio) {
+            audio_renderer_stop();
+        }
+        if (use_video && (close_window || preserve_connections || full_video_reset)) {
+"""
+    new = """        if (use_audio) {
+            audio_renderer_stop(NULL);
+        }
+        if (use_video && (close_window || preserve_connections || full_video_reset)) {
+"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find the relaunch_video audio_renderer_stop() call")
+    uxplay_content = uxplay_content.replace(old, new, 1)
 
 with open(uxplay_path, "w") as f:
     f.write(uxplay_content)

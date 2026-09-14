@@ -36,6 +36,9 @@ fi
 echo "=== Copying embedded mDNS source ==="
 cp "$SCRIPT_DIR/src/dnssd_embedded.c" "$SCRIPT_DIR/lib/uxplay/lib/dnssd_embedded.c"
 
+echo "=== Copying per-session audio renderer source ==="
+cp "$SCRIPT_DIR/src/audio_renderer.c" "$SCRIPT_DIR/src/audio_renderer.h" "$SCRIPT_DIR/lib/uxplay/renderers/"
+
 echo "=== Patching CMakeLists.txt for embedded mDNS ==="
 "$BUILD_PYTHON" "$SCRIPT_DIR/patch_cmake.py"
 

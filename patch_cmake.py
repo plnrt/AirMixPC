@@ -1363,4 +1363,161 @@ if "audio_renderer_set_error_callback(audio_renderer_error_callback);" not in ux
 with open(uxplay_path, "w") as f:
     f.write(uxplay_content)
 
+# 12. Tag every AIRMIX_METRIC/AIRMIX_EVENT line with sid= as the first key
+# (D7, frozen telemetry contract), including for a single client, and emit
+# AIRMIX_EVENT start once a session's renderer has actually started.
+with open(raop_rtp_path, "r") as f:
+    raop_rtp_content = f.read()
+
+if "AIRMIX_METRIC sid=" not in raop_rtp_content:
+    old_periodic = """            if (airmix_stats.received - airmix_last_report >= 512) {
+                logger_log(raop_rtp->logger, LOGGER_INFO,
+                           "AIRMIX_METRIC received=%llu missing=%llu retransmitted=%llu late=%llu flushes=%llu decoder_errors=0 sink_errors=0",
+                           (unsigned long long) airmix_stats.received,
+                           (unsigned long long) airmix_stats.missing,
+                           (unsigned long long) airmix_retransmitted,
+                           (unsigned long long) airmix_stats.late,
+                           (unsigned long long) airmix_stats.flushes);
+                airmix_last_report = airmix_stats.received;
+            }"""
+    new_periodic = """            if (airmix_stats.received - airmix_last_report >= 512) {
+                logger_log(raop_rtp->logger, LOGGER_INFO,
+                           "AIRMIX_METRIC sid=%u received=%llu missing=%llu retransmitted=%llu late=%llu flushes=%llu decoder_errors=0 sink_errors=0",
+                           (unsigned int) raop_rtp->callbacks.session_id,
+                           (unsigned long long) airmix_stats.received,
+                           (unsigned long long) airmix_stats.missing,
+                           (unsigned long long) airmix_retransmitted,
+                           (unsigned long long) airmix_stats.late,
+                           (unsigned long long) airmix_stats.flushes);
+                airmix_last_report = airmix_stats.received;
+            }"""
+    if old_periodic not in raop_rtp_content:
+        raise RuntimeError("raop_rtp.c: could not find the periodic AIRMIX_METRIC log")
+    raop_rtp_content = raop_rtp_content.replace(old_periodic, new_periodic, 1)
+
+    old_final = """    raop_buffer_stats_t airmix_stats;
+    raop_buffer_get_stats(raop_rtp->buffer, &airmix_stats);
+    logger_log(raop_rtp->logger, LOGGER_INFO,
+               "AIRMIX_METRIC received=%llu missing=%llu retransmitted=%llu late=%llu flushes=%llu decoder_errors=0 sink_errors=0",
+               (unsigned long long) airmix_stats.received,
+               (unsigned long long) airmix_stats.missing,
+               (unsigned long long) airmix_retransmitted,
+               (unsigned long long) airmix_stats.late,
+               (unsigned long long) airmix_stats.flushes);
+    logger_log(raop_rtp->logger, LOGGER_INFO, "AIRMIX_EVENT disconnect reason=ended");"""
+    new_final = """    raop_buffer_stats_t airmix_stats;
+    raop_buffer_get_stats(raop_rtp->buffer, &airmix_stats);
+    logger_log(raop_rtp->logger, LOGGER_INFO,
+               "AIRMIX_METRIC sid=%u received=%llu missing=%llu retransmitted=%llu late=%llu flushes=%llu decoder_errors=0 sink_errors=0",
+               (unsigned int) raop_rtp->callbacks.session_id,
+               (unsigned long long) airmix_stats.received,
+               (unsigned long long) airmix_stats.missing,
+               (unsigned long long) airmix_retransmitted,
+               (unsigned long long) airmix_stats.late,
+               (unsigned long long) airmix_stats.flushes);
+    logger_log(raop_rtp->logger, LOGGER_INFO, "AIRMIX_EVENT disconnect sid=%u reason=ended",
+               (unsigned int) raop_rtp->callbacks.session_id);"""
+    if old_final not in raop_rtp_content:
+        raise RuntimeError("raop_rtp.c: could not find the final AIRMIX_METRIC/disconnect log")
+    raop_rtp_content = raop_rtp_content.replace(old_final, new_final, 1)
+
+with open(raop_rtp_path, "w") as f:
+    f.write(raop_rtp_content)
+
+with open(uxplay_path, "r") as f:
+    uxplay_content = f.read()
+
+if "airmix_percent_encode" not in uxplay_content:
+    anchor = "static gboolean feedback_callback(gpointer loop) {"
+    if anchor not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find feedback_callback to anchor the telemetry helpers")
+    uxplay_content = uxplay_content.replace(
+        anchor,
+        """static std::string airmix_percent_encode(const std::string &value) {
+    static const char *hex_digits = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(value.size());
+    for (unsigned char c : value) {
+        bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                           c == '.' || c == '_' || c == '~' || c == '-';
+        if (unreserved) {
+            out.push_back((char) c);
+        } else {
+            out.push_back('%');
+            out.push_back(hex_digits[(c >> 4) & 0xF]);
+            out.push_back(hex_digits[c & 0xF]);
+        }
+    }
+    return out;
+}
+
+static const char *airmix_codec_name(unsigned char ct) {
+    switch (ct) {
+    case 2:
+        return "ALAC";
+    case 8:
+        return "AAC_ELD";
+    case 4:
+        return "AAC_LC";
+    case 1:
+        return "PCM";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+"""
+        + anchor,
+        1,
+    )
+
+if "slot->device = name ? name : \"\";" not in uxplay_content:
+    old = """    if (check_blocked_client(deviceid)) {
+        *admit = false;
+        LOGI("*** attempt to connect by blocked client (clientID %s): DENIED\\n", deviceid);
+    }
+    // Pass device model to renderer for device frame display
+    if (*admit && use_video) {
+        video_renderer_set_device_model(model, name);
+    }
+}"""
+    new = """    if (check_blocked_client(deviceid)) {
+        *admit = false;
+        LOGI("*** attempt to connect by blocked client (clientID %s): DENIED\\n", deviceid);
+    }
+    if (airmix_slot *slot = airmix_slot_find(cls)) {
+        slot->device = name ? name : "";
+        slot->model = model ? model : "";
+    }
+    // Pass device model to renderer for device frame display
+    if (*admit && use_video) {
+        video_renderer_set_device_model(model, name);
+    }
+}"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find report_client_request to store device/model in the slot")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "AIRMIX_EVENT start sid=" not in uxplay_content:
+    old = """    if (use_audio) {
+      audio_renderer_start(cls, raop_connection_id(cls), ct);
+    }
+"""
+    new = """    if (use_audio) {
+      audio_renderer_start(cls, raop_connection_id(cls), ct);
+      airmix_slot *started_slot = airmix_slot_find(cls);
+      LOGI("AIRMIX_EVENT start sid=%u device=%s model=%s codec=%s",
+           raop_connection_id(cls),
+           airmix_percent_encode(started_slot ? started_slot->device : "").c_str(),
+           airmix_percent_encode(started_slot ? started_slot->model : "").c_str(),
+           airmix_codec_name(*ct));
+    }
+"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find audio_get_format's renderer-start call to add AIRMIX_EVENT start")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+with open(uxplay_path, "w") as f:
+    f.write(uxplay_content)
+
 print(f"Patched {cmake_path}")

@@ -254,7 +254,7 @@ static gboolean gstreamer_audio_pipeline_bus_callback(GstBus *bus, GstMessage *m
             gst_element_set_state(session->pipeline, GST_STATE_READY);
         }
         if (!multi_session) {
-            logger_log(logger, LOGGER_INFO, "AIRMIX_EVENT error type=sink reason=audio_error count=1");
+            logger_log(logger, LOGGER_INFO, "AIRMIX_EVENT error sid=%u type=sink reason=audio_error count=1", session->sid);
             if (g_loop) {
                 g_main_loop_quit((GMainLoop *) g_loop);
             }
@@ -544,7 +544,7 @@ void audio_renderer_render_buffer(void *cls, unsigned char *data, int *data_len,
     } else {
         logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", ct);
         if (!multi_session) {
-            logger_log(logger, LOGGER_INFO, "AIRMIX_EVENT error type=decoder reason=audio_error count=1");
+            logger_log(logger, LOGGER_INFO, "AIRMIX_EVENT error sid=%u type=decoder reason=audio_error count=1", sid);
         } else if (error_callback) {
             error_callback(cls, sid, "decoder");
         }

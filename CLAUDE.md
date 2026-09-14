@@ -167,7 +167,12 @@ to `D:\AirMixPC` on 2026-09-14 (registry DisplayVersion 1.1.0; installed
 `settings.json` and `trusted-devices.register` were preserved, and
 `settings.json` gained `maxClients: 4`). The user confirmed on real hardware
 that an iPhone and an iPad connect to `AirMix PC` and play at the same time.
-The 1.1.0 installer has not been published as a GitHub release.
+The 1.1.0 installer was published on 2026-09-14 as GitHub release
+`airmix-pc-v1.1.0` (https://github.com/plnrt/AirMixPC/releases/tag/airmix-pc-v1.1.0)
+with `AirMixPC-Setup-1.1.0.exe` and `SHA256SUMS.txt`. Release tags on the fork
+use the `airmix-pc-vX.Y.Z` prefix because plain `vX.Y.Z` tags belong to the
+upstream UxPlayEnhanced history. The main window was redesigned in the same
+release (DPI-aware, sized to content, per-device rows, status badge).
 
 Known cosmetic limitation carried from the WP-B implementation: metadata-text
 deduplication (`launcher`/core console output that suppresses repeated,

@@ -52,5 +52,29 @@ class TrayTests(unittest.TestCase):
                 tray.LOG_DIR, tray.LOG_PATH = old_dir, old_path
 
 
+class MultiSessionTrayTests(unittest.TestCase):
+    def setUp(self):
+        # Isolate the module-level session registry between tests.
+        tray.sessions.clear()
+
+    def test_receiver_arguments_include_max_clients_and_stay_audio_only(self):
+        args = tray.receiver_arguments()
+        self.assertEqual(args[args.index("-maxclients") + 1], "4")
+        self.assertEqual(args[args.index("-vs") + 1], "0")
+
+    def test_sessions_is_a_session_registry(self):
+        self.assertIsInstance(tray.sessions, tray.core.SessionRegistry)
+
+    def test_handle_output_line_start_populates_session_lines_and_summary(self):
+        tray.handle_output_line("AIRMIX_EVENT start sid=1 device=Test%20iPad model=iPad")
+        self.assertEqual(tray.session_lines(), ["Test iPad — Connected"])
+        self.assertEqual(tray.sessions_text(), "Devices: Test iPad")
+
+    def test_handle_output_line_disconnect_clears_session_lines(self):
+        tray.handle_output_line("AIRMIX_EVENT start sid=1 device=Test%20iPad model=iPad")
+        tray.handle_output_line("AIRMIX_EVENT disconnect sid=1 reason=ended")
+        self.assertEqual(tray.session_lines(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

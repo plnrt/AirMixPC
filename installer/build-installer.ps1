@@ -13,7 +13,7 @@ if (-not (Test-Path (Join-Path $root 'dist\AirMixPC\AirMixPC.exe'))) {
 }
 & $compiler (Join-Path $PSScriptRoot 'AirMixPC.iss')
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compiler failed with exit code $LASTEXITCODE" }
-$output = Join-Path $root 'dist\installer\AirMixPC-Setup-1.0.2.exe'
+$output = Join-Path $root 'dist\installer\AirMixPC-Setup-1.1.0.exe'
 $hash = (Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash.ToLowerInvariant()
 Set-Content -LiteralPath (Join-Path (Split-Path $output) 'SHA256SUMS.txt') -Encoding ASCII `
-    -Value "$hash  AirMixPC-Setup-1.0.2.exe"
+    -Value "$hash  AirMixPC-Setup-1.1.0.exe"

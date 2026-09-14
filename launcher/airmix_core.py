@@ -13,7 +13,7 @@ from urllib.parse import unquote
 
 
 APP_NAME = "AirMix PC"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.1.0"
 APP_SLUG = "AirMixPC"
 DEFAULT_MAX_CLIENTS = 4
 MIN_CLIENTS = 1

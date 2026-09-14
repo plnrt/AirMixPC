@@ -56,6 +56,7 @@ LOG_BACKUP_COUNT = 2
 settings = core.load_settings(SETTINGS_PATH)
 core.save_settings(SETTINGS_PATH, settings)
 auto_policy = core.AutoPolicy()
+sessions = core.SessionRegistry()
 process = None
 reader_thread = None
 shutdown_signal = None
@@ -249,6 +250,7 @@ def receiver_arguments():
         "-key", str(PRIVATE_KEY_PATH), "-reset", "15",
     ]
     args.extend(core.mode_arguments(concrete))
+    args.extend(core.max_clients_arguments(settings["maxClients"]))
     if not VERBOSE_LOGGING:
         args.append("-no-progress")
     return args
@@ -261,6 +263,8 @@ def handle_output_line(line):
     promote = False
     with state_lock:
         apply_log_line(session_state, line)
+        if telemetry:
+            sessions.apply(telemetry[0], telemetry[1])
         if settings["mode"] == "auto" and telemetry:
             kind, payload = telemetry
             if kind == "metric":
@@ -302,6 +306,7 @@ def start_uxplay():
     startupinfo.wShowWindow = 0
     with state_lock:
         session_state.update(new_state())
+        sessions.clear()
         try:
             process = subprocess.Popen(
                 receiver_arguments(), cwd=SCRIPT_DIR, env=env, stdout=subprocess.PIPE,
@@ -355,6 +360,8 @@ def set_mode(icon, mode):
     settings["mode"] = mode
     auto_policy.stable = False
     auto_policy.reset_session()
+    with state_lock:
+        sessions.clear()
     save_current_settings()
     if receiver_enabled:
         start_uxplay()
@@ -463,6 +470,17 @@ def host_text(item=None):
 
 def client_text(item=None):
     return "Client: " + (read_state()["client"] or "Waiting")
+
+
+def session_lines():
+    with state_lock:
+        return sessions.lines()
+
+
+def sessions_text(item=None):
+    with state_lock:
+        summary = sessions.summary()
+    return "Devices: " + summary
 
 
 def status_text(item=None):
@@ -603,13 +621,13 @@ class AirMixWindow:
         top = ttk.Frame(body)
         top.pack(fill="x")
         ttk.Label(top, text="AirMix PC", style="Header.TLabel").pack(side="left")
-        ttk.Label(top, text="iPhone + Windows audio over Wi-Fi", style="Sub.TLabel").pack(side="left", padx=(14, 0), pady=(12, 0))
+        ttk.Label(top, text="iPhone, iPad + Windows audio over Wi-Fi", style="Sub.TLabel").pack(side="left", padx=(14, 0), pady=(12, 0))
         ttk.Label(top, text=f"v{core.APP_VERSION}", style="Sub.TLabel").pack(side="right", pady=(12, 0))
 
         status = ttk.Frame(body, style="Card.TFrame", padding=18)
         status.pack(fill="x", pady=(20, 10))
         self._row(status, "RECEIVER", "status")
-        self._row(status, "IPHONE", "client")
+        self._row(status, "DEVICES", "client")
         self._row(status, "NOW PLAYING", "song")
         self._row(status, "FORMAT", "quality")
 
@@ -676,7 +694,7 @@ class AirMixWindow:
         with state_lock:
             running = process is not None and process.poll() is None
         self.values["status"].set("Connected" if state["audio_connected"] else ("Waiting for AirPlay" if running else "Stopped"))
-        self.values["client"].set(state["client"] or "No iPhone connected")
+        self.values["client"].set("\n".join(session_lines()) or "No devices connected")
         self.values["song"].set(current_song(state))
         self.values["quality"].set(state["quality"] or "Waiting for audio")
         self.values["output"].set(state["output"])
@@ -699,7 +717,7 @@ def run_tray():
             pystray.MenuItem(f"Version {core.APP_VERSION}", None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(host_text, None, enabled=False),
-            pystray.MenuItem(client_text, None, enabled=False),
+            pystray.MenuItem(sessions_text, None, enabled=False),
             pystray.MenuItem(status_text, None, enabled=False),
             pystray.MenuItem(output_text, None, enabled=False),
             pystray.MenuItem(mode_text, None, enabled=False),

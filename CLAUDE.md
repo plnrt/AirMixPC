@@ -8,8 +8,10 @@ authoritative where older UxPlayEnhanced text in the README disagrees.
 
 - Repository: `https://github.com/plnrt/AirMixPC`
 - Development/default branch: `airmix-pc`
-- Current application version: `1.0.2`
-- Current handoff base commit: `3bdd60c`
+- Current application version: `1.1.0`
+- Current handoff base commit: `fe5134c` (tip of the multi-session-audio work;
+  see "Current installed/tested state" below for what has and has not been
+  verified at this version)
 - License: GPL-3.0; preserve all upstream notices and corresponding source.
 - Pinned UxPlayEnhanced base: `77b88a7b05c67c7d4a388d2fe8fe15c8078b564d`
 - Pinned UxPlay submodule: `5de48c3d7ba07de396639dd3704de908b649f37f`
@@ -53,6 +55,17 @@ Modes are defined in `launcher/airmix_core.py`:
   connection to Stable after repeated loss, late packets, flushes, or network
   disconnects.
 
+AirMix PC accepts more than one Apple device at once under the single
+receiver name `AirMix PC`. The core is started with `-maxclients N`
+(audio-only; the UxPlay core itself defaults to 1 and forces 1 if video is
+ever enabled, since `-vs 0` is fixed in v1). The tray always passes an
+explicit value from `settings.json`'s `maxClients` (default 4, valid range
+1-12; 12 is the underlying `httpd` connection-slot limit). Each admitted
+device gets its own GStreamer pipeline and `wasapi2sink`; Windows mixes the
+outputs. Devices are independent, unsynchronized sources — this is not
+multi-room/multi-device sync. Changing the latency mode or the Windows
+default output still restarts the whole core and drops every device.
+
 ## Architecture
 
 - `launcher/airmix_core.py`: settings, mode arguments, telemetry parsing, Auto
@@ -60,7 +73,17 @@ Modes are defined in `launcher/airmix_core.py`:
 - `launcher/airmix_tray.pyw`: Tk/pystray GUI, receiver watchdog, notifications,
   output monitoring, and subprocess lifecycle.
 - `src/dnssd_embedded.c`: Bonjour-free `_airplay._tcp` and `_raop._tcp` mDNS.
-- `patch_cmake.py`: applies integration and telemetry changes to pinned UxPlay.
+- `src/audio_renderer.c`, `src/audio_renderer.h`: full-file replacement of
+  UxPlay's `renderers/audio_renderer.c`/`.h`; adds a per-session pipeline
+  registry (one GStreamer pipeline and `wasapi2sink` per connected device)
+  instead of upstream's single global pipeline. `build.sh` copies both files
+  into `lib/uxplay/renderers/` before the build, alongside the
+  `dnssd_embedded.c` copy.
+- `patch_cmake.py`: applies integration and telemetry changes to pinned UxPlay,
+  including a per-connection slot table in `uxplay.cpp` (`airmix_slot`, one
+  slot per admitted connection, holding `cls`, `sid`, clock offset, missed
+  feedback count, device/model strings) and the `-maxclients` admission and
+  disconnect wiring described below.
 - `build.sh`: builds UxPlay, PyInstaller GUI, runtime DLL closure, hashes, and
   distributable `dist/AirMixPC`.
 - `installer/AirMixPC.iss`: normal Inno Setup installer.
@@ -71,6 +94,42 @@ Modes are defined in `launcher/airmix_core.py`:
 The UxPlay core emits structured `AIRMIX_METRIC` and `AIRMIX_EVENT` lines on
 stdout. The tray controller parses them and owns policy decisions. Preserve this
 boundary rather than burying UI policy in the C core.
+
+### Core/tray telemetry contract
+
+Every connected device gets a monotonically increasing `unsigned int`
+session id (`sid`, starting at 1, assigned once per connection and never
+reused within a process run). The wire format is frozen:
+
+```text
+AIRMIX_EVENT start sid=1 device=Artur%27s%20iPhone model=iPhone17,1 codec=ALAC
+AIRMIX_METRIC sid=1 received=… missing=… retransmitted=… late=… flushes=… decoder_errors=0 sink_errors=0
+AIRMIX_EVENT error sid=1 type=sink reason=audio_error count=1
+AIRMIX_EVENT error sid=1 type=decoder reason=audio_error count=1
+AIRMIX_EVENT disconnect sid=1 reason=ended
+AIRMIX_EVENT disconnect sid=1 reason=network
+```
+
+Rules for anyone touching this boundary:
+
+- `sid=` is always the first key on every line, including when only one
+  device is connected (there is no legacy no-`sid` form).
+- Existing keys (`received`, `missing`, `type`, `reason`, …) are never
+  renamed; new fields are only ever appended.
+- `device` and `model` are percent-encoded byte-for-byte (everything outside
+  `[A-Za-z0-9._~-]` becomes `%XX` over UTF-8); the Python side decodes with
+  `launcher/airmix_core.py`'s `decode_field` (`urllib.parse.unquote`, where
+  `+` is not treated as a space).
+- A `disconnect` line with no `sid` (for example the tray's own
+  `disconnect reason=unexpected`) is process-wide and clears the entire
+  session registry, not just one device.
+
+On the Python side, `launcher/airmix_core.py` owns a `SessionRegistry`
+(`SessionState` per `sid`, keyed by `sid`, exposing `apply`, `lines()`,
+`summary()`) that consumes this telemetry independently of Auto mode's own
+per-session baselines (`AutoPolicy.last_metrics` is keyed by `sid` too, so
+loss/late/flush counters do not bleed between devices). The tray's device
+list and menu render `SessionRegistry.lines()` / `.summary()`.
 
 ## Current installed/tested state
 
@@ -90,6 +149,24 @@ The v1.0.2 package build verified 164 PE files: 162 DLLs and 2 EXEs. The Python
 suite passed 26 tests, with 2 optional live shutdown tests skipped unless a
 built package is supplied. The local installer was built as
 `AirMixPC-Setup-1.0.2.exe`; it has not yet been published as a GitHub release.
+
+Version 1.1.0 (multi-session audio, `-maxclients`) has been built locally only:
+`./build.sh` completed and verified 164 PE files (162 DLLs, 2 EXEs), and
+`python -m unittest discover -s tests -v` passed 74 tests (2 skipped, the same
+optional live-shutdown tests as above). 1.1.0 has **not** been installed to
+`D:\AirMixPC` or anywhere else, and no live test with a real iPhone and iPad
+connected at the same time has been run. Do not treat multi-device behavior,
+per-session telemetry, or admission/disconnect handling as confirmed on real
+hardware until that live test happens and the user reports back.
+
+Known cosmetic limitation carried from the WP-B implementation: metadata-text
+deduplication (`launcher`/core console output that suppresses repeated,
+unchanged song metadata blocks) is still process-global rather than per
+session, so with two simultaneous devices playing identical metadata text the
+second device's metadata block can be suppressed in the console/log. This does
+not affect the frozen `AIRMIX_METRIC`/`AIRMIX_EVENT` telemetry contract and
+does not affect the `-md` metadata file output, which was already
+non-deduplicated.
 
 ## Current discovery problem
 
@@ -143,9 +220,9 @@ Most useful next investigation:
 6. Verify the installer creates rules for the process that actually owns the
    sockets (`uxplay.exe`), not only the PyInstaller controller, while retaining
    program-scoped, inbound-only, Private-network rules.
-7. Update the stale README Bonjour section: it still says every active IPv4
-   interface is advertised and that VPN appearance is picked up. That no longer
-   matches the current routed-LAN policy.
+7. Done: the README Bonjour section now describes the routed-LAN, gateway-only
+   policy instead of the stale "every active IPv4 interface" / VPN-appears
+   claim.
 
 Do not disable or stop the VPN without explicit user authorization. Do not
 change router isolation, firewall policy, or network category without first
@@ -193,6 +270,12 @@ Before any release:
   works merely because the code builds.
 - Preserve unrelated user changes and never reset or clean a dirty worktree.
 - Use small, reviewable commits on `airmix-pc` and push them to `plnrt/AirMixPC`.
+  In this checkout, the `fork` remote points at `plnrt/AirMixPC` and is the one
+  to push to; `origin` points at the upstream `Kylepossible/UxPlayEnhanced`
+  repository and must never be pushed to.
+- `.workflow/` holds local orchestration artifacts (plans, decisions,
+  acceptance criteria, execution reports) for agent-driven runs. It is listed
+  in `.gitignore` and must never be committed.
 - Never commit secrets, generated receiver keys, trusted-device registries,
   local IP configuration dumps, or logs containing private metadata.
 - Ask the user to run local/hardware checks when cloud execution cannot observe

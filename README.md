@@ -28,6 +28,28 @@ Pinned upstream source revisions:
 - UxPlayEnhanced: `77b88a7b05c67c7d4a388d2fe8fe15c8078b564d`
 - UxPlay: `5de48c3d7ba07de396639dd3704de908b649f37f`
 
+## Multiple Devices
+
+AirMix PC can accept more than one Apple device at the same time under the
+single receiver name `AirMix PC`. Each connecting device gets its own
+GStreamer pipeline and its own `wasapi2sink` in shared mode; Windows mixes
+all of those streams (and any other PC audio) before they reach the output
+device. The number of devices allowed at once is controlled by `maxClients`
+in `%LOCALAPPDATA%\AirMixPC\settings.json`, defaulting to 4 with a valid
+range of 1-12. Twelve is the underlying connection-slot limit; in practice
+keeping it at 4 or lower is more realistic for a shared Windows audio
+endpoint.
+
+Streams from different devices are **not** synchronized with each other —
+each is treated as an independent source, which is fine for mixing separate
+audio but not suitable for two devices playing the same song in unison.
+Changing the latency mode or the Windows default output restarts the
+receiver core and disconnects every connected device. AirPlay volume is
+tracked per device, while the overall output volume stays a single, shared
+Windows setting. Losing the connection to one device only ends that
+device's session; the others keep playing. The tray window and menu list
+every currently connected device.
+
 ## Upstream project notes
 
 **A lightweight, audio-only, Bonjour-free UxPlay distribution for Windows.**
@@ -192,13 +214,15 @@ embedded responder in `src/dnssd_embedded.c`. It:
 - Sends startup announcements and TTL=0 goodbye records
 - Runs in-process without `dnssd.dll`, iTunes, iCloud, or Bonjour services
 
-Discovery is advertised on every up, non-loopback IPv4 interface rather than
-only the one that routes toward the internet, so a PC on both Ethernet and
-Wi-Fi is reachable from either network and a machine with no default route
-still works. Each interface advertises its own address. The interface list is
-rechecked every 15 seconds, so joining Wi-Fi, docking, or raising a VPN is
-picked up without a restart, and services are re-announced on links that
-appear.
+Discovery is advertised only on active IPv4 interfaces that have an IPv4
+gateway; PPP, tunnel, and no-multicast adapters (including VPN TAP
+interfaces such as WatchGuard Mobile VPN) are skipped so AirPlay traffic
+stays on the routed home LAN. Each qualifying interface advertises its own
+address. The interface list is rechecked every 15 seconds, so joining
+Wi-Fi, docking, or a network change is picked up without a restart, and an
+unsolicited announcement of active services is repeated every 30 seconds so
+a browsing client that missed the initial announcement still finds the
+receiver.
 
 ## Build from Source
 
@@ -277,11 +301,16 @@ Per-component notes:
 | `lib/uxplay/` (submodule) | GPL-3.0 — see [lib/uxplay/LICENSE](lib/uxplay/LICENSE) |
 | `lib/uxplay/lib/` (upstream AirPlay library, derived from RPiPlay/shairplay) | LGPL-2.1-or-later |
 | `src/dnssd_embedded.c` | LGPL-2.1-or-later, matching the upstream `lib/dnssd.c` it replaces |
+| `src/audio_renderer.c`, `src/audio_renderer.h` | GPL-3.0 — modified upstream `renderers/audio_renderer.c` (RPiPlay/UxPlay) |
 | `patch_cmake.py`, `build.sh`, `launcher/` | GPL-3.0 |
 
 `src/dnssd_embedded.c` stays under LGPL-2.1-or-later so it remains usable in the
 same places upstream's `lib/dnssd.c` is; the "or later" grant makes it
-compatible with the GPL-3.0 work it links into.
+compatible with the GPL-3.0 work it links into. `src/audio_renderer.c` and
+`src/audio_renderer.h` are a full file replacement of UxPlay's
+`renderers/audio_renderer.c`/`.h`, adding per-session pipelines for multiple
+connected devices; `build.sh` copies both into `lib/uxplay/renderers/` before
+the build, the same way it does for `dnssd_embedded.c`.
 
 The complete corresponding source for a binary release is this repository at the
 matching tag, together with the `lib/uxplay` submodule commit it pins.

@@ -4,6 +4,12 @@ AirMix PC is distributed under GNU GPL version 3. Its source is based on
 UxPlayEnhanced and the pinned FDH2/UxPlay submodule. See `LICENSE` and the
 copyright headers in the corresponding source files.
 
+`src/audio_renderer.c` and `src/audio_renderer.h` are a modified, GPL-3.0
+replacement of UxPlay's `renderers/audio_renderer.c`/`.h` (itself derived
+from RPiPlay), adding per-session audio pipelines so multiple Apple devices
+can stream to AirMix PC at once. `build.sh` copies both files into
+`lib/uxplay/renderers/` before the build, replacing the upstream sources.
+
 The binary package contains runtime components from these projects:
 
 - UxPlay — GPLv3; https://github.com/FDH2/UxPlay

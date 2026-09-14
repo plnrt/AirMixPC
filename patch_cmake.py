@@ -1162,4 +1162,205 @@ if "audio_renderer_stop(NULL);\n        }\n        if (use_video && (close_windo
 with open(uxplay_path, "w") as f:
     f.write(uxplay_content)
 
+# 11. Per-session resilience (D6): feedback timeouts and sink/decoder errors
+# disconnect only the affected AirPlay session when max_clients > 1, instead
+# of tearing down the whole process the way the single-client legacy path
+# still does at max_clients <= 1.
+with open(uxplay_path, "r") as f:
+    uxplay_content = f.read()
+
+# The airmix_slot struct/table (added ahead of conn_init by the per-session
+# renderer patch) also needs to be visible to feedback_callback, which is
+# defined earlier in the file. Move the block up the first time this runs;
+# on a later run it is already in place and this is a no-op.
+idx_struct = uxplay_content.find("struct airmix_slot {")
+idx_feedback = uxplay_content.find("static gboolean feedback_callback(gpointer loop) {")
+if idx_struct == -1 or idx_feedback == -1:
+    raise RuntimeError("uxplay.cpp: could not find airmix_slot struct or feedback_callback")
+if idx_struct > idx_feedback:
+    airmix_block = """#define AIRMIX_MAX_SLOTS 12   /* matches httpd.c's MAX_CONNECTIONS */
+struct airmix_slot {
+    void *cls;
+    unsigned int sid;
+    uint64_t clock_offset;
+    unsigned int missed_feedback;
+    bool audio_started;
+    std::string device;
+    std::string model;
+};
+static airmix_slot airmix_slots[AIRMIX_MAX_SLOTS];
+
+static airmix_slot *airmix_slot_find(void *cls) {
+    if (!cls) return NULL;
+    for (int i = 0; i < AIRMIX_MAX_SLOTS; i++) {
+        if (airmix_slots[i].cls == cls) return &airmix_slots[i];
+    }
+    return NULL;
+}
+
+static airmix_slot *airmix_slot_claim(void *cls) {
+    if (!cls) return NULL;
+    airmix_slot *slot = airmix_slot_find(cls);
+    if (slot) return slot;
+    for (int i = 0; i < AIRMIX_MAX_SLOTS; i++) {
+        if (airmix_slots[i].cls == NULL) {
+            airmix_slots[i] = airmix_slot();
+            airmix_slots[i].cls = cls;
+            airmix_slots[i].sid = raop_connection_id(cls);
+            return &airmix_slots[i];
+        }
+    }
+    return NULL;
+}
+
+static void airmix_slot_release(void *cls) {
+    airmix_slot *slot = airmix_slot_find(cls);
+    if (slot) {
+        *slot = airmix_slot();
+    }
+}
+
+"""
+    if airmix_block not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: airmix_slot block text did not match exactly; cannot relocate it")
+    uxplay_content = uxplay_content.replace(airmix_block, "", 1)
+    anchor = "static gboolean feedback_callback(gpointer loop) {"
+    if anchor not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find feedback_callback to relocate the airmix_slot block before it")
+    uxplay_content = uxplay_content.replace(anchor, airmix_block + anchor, 1)
+
+if "for (int i = 0; i < AIRMIX_MAX_SLOTS; i++) {\n            airmix_slot *slot = &airmix_slots[i];" not in uxplay_content:
+    old_feedback = """static gboolean feedback_callback(gpointer loop) {
+    if (open_connections) {
+        if (missed_feedback_limit && missed_feedback > missed_feedback_limit) {
+            LOGI("***ERROR lost connection with client (network problem?)");
+            LOGI("AIRMIX_EVENT disconnect reason=network");
+            LOGI("   Interval since last client feedback request exceeds limit of %u seconds", missed_feedback_limit);
+            LOGI("   Sometimes the network connection may recover after a longer delay:\\n"
+                 "   the default limit n = %d seconds, can be changed with the \\"-reset n\\" option", MISSED_FEEDBACK_LIMIT);
+            if (!nofreeze) {
+                close_window = false; /* leave "frozen" window open if reset_video is false */
+            }
+            reset_httpd = true;
+            relaunch_video = true;
+            full_video_reset = true;
+            g_main_loop_quit((GMainLoop *) loop);
+            return TRUE;
+        } else if (missed_feedback > 2) {
+            LOGE("%3u seconds since last client feedback request (expected every two seconds); client may be offline", missed_feedback);
+        }
+        missed_feedback++;
+    } else {
+        missed_feedback = 0;
+    }
+    return TRUE;
+}"""
+    new_feedback = """static gboolean feedback_callback(gpointer loop) {
+    if (max_clients <= 1) {
+        if (open_connections) {
+            if (missed_feedback_limit && missed_feedback > missed_feedback_limit) {
+                LOGI("***ERROR lost connection with client (network problem?)");
+                LOGI("AIRMIX_EVENT disconnect reason=network");
+                LOGI("   Interval since last client feedback request exceeds limit of %u seconds", missed_feedback_limit);
+                LOGI("   Sometimes the network connection may recover after a longer delay:\\n"
+                     "   the default limit n = %d seconds, can be changed with the \\"-reset n\\" option", MISSED_FEEDBACK_LIMIT);
+                if (!nofreeze) {
+                    close_window = false; /* leave "frozen" window open if reset_video is false */
+                }
+                reset_httpd = true;
+                relaunch_video = true;
+                full_video_reset = true;
+                g_main_loop_quit((GMainLoop *) loop);
+                return TRUE;
+            } else if (missed_feedback > 2) {
+                LOGE("%3u seconds since last client feedback request (expected every two seconds); client may be offline", missed_feedback);
+            }
+            missed_feedback++;
+        } else {
+            missed_feedback = 0;
+        }
+    } else if (missed_feedback_limit) {
+        for (int i = 0; i < AIRMIX_MAX_SLOTS; i++) {
+            airmix_slot *slot = &airmix_slots[i];
+            if (!slot->cls || !slot->audio_started) {
+                continue;
+            }
+            slot->missed_feedback++;
+            if (slot->missed_feedback > missed_feedback_limit) {
+                LOGI("AIRMIX_EVENT disconnect sid=%u reason=network", slot->sid);
+                raop_disconnect_connection(raop, slot->cls);
+                slot->audio_started = false;
+            }
+        }
+    }
+    return TRUE;
+}"""
+    if old_feedback not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find feedback_callback to add the per-session branch")
+    uxplay_content = uxplay_content.replace(old_feedback, new_feedback, 1)
+
+if "slot->missed_feedback = 0;" not in uxplay_content:
+    old_conn_feedback = """extern "C" void conn_feedback (void *cls) {
+    /* received client heartbeat signal: connection still exists */
+    missed_feedback = 0;
+}"""
+    new_conn_feedback = """extern "C" void conn_feedback (void *cls) {
+    /* received client heartbeat signal: connection still exists */
+    if (airmix_slot *slot = airmix_slot_find(cls)) {
+        slot->missed_feedback = 0;
+    }
+    missed_feedback = 0;
+}"""
+    if old_conn_feedback not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find conn_feedback callback")
+    uxplay_content = uxplay_content.replace(old_conn_feedback, new_conn_feedback, 1)
+
+if 'AIRMIX_EVENT disconnect sid=%u reason=network", raop_connection_id(cls)' not in uxplay_content:
+    old = """    case 1:
+        LOGI("*** ERROR lost connection with client (network problem?)");
+        LOGI("AIRMIX_EVENT disconnect reason=network");
+	break;"""
+    new = """    case 1:
+        LOGI("*** ERROR lost connection with client (network problem?)");
+        LOGI("AIRMIX_EVENT disconnect sid=%u reason=network", raop_connection_id(cls));
+	break;"""
+    if old not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find conn_reset's network disconnect log line")
+    uxplay_content = uxplay_content.replace(old, new, 1)
+
+if "audio_renderer_error_callback" not in uxplay_content:
+    anchor = 'extern "C" void audio_stop_coverart_rendering(void *cls) {'
+    if anchor not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find an anchor to add the audio renderer error callback")
+    uxplay_content = uxplay_content.replace(
+        anchor,
+        'extern "C" void audio_renderer_error_callback(void *cls, unsigned int sid, const char *type) {\n'
+        '    LOGI("AIRMIX_EVENT error sid=%u type=%s reason=audio_error count=1", sid, type);\n'
+        '    raop_disconnect_connection(raop, cls);\n'
+        '}\n\n'
+        + anchor,
+        1,
+    )
+
+if "audio_renderer_set_error_callback(audio_renderer_error_callback);" not in uxplay_content:
+    anchor = """    if (use_audio) {
+        audio_renderer_init(render_logger, audiosink.c_str(), &audio_sync, &video_sync, audio_rtp_pipeline.c_str());
+    } else {
+        LOGI("audio_disabled");
+    }
+"""
+    new_anchor = """    if (use_audio) {
+        audio_renderer_init(render_logger, audiosink.c_str(), &audio_sync, &video_sync, audio_rtp_pipeline.c_str());
+        audio_renderer_set_error_callback(audio_renderer_error_callback);
+    } else {
+        LOGI("audio_disabled");
+    }
+"""
+    if anchor not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find audio_renderer_init call to register the error callback")
+    uxplay_content = uxplay_content.replace(anchor, new_anchor, 1)
+
+with open(uxplay_path, "w") as f:
+    f.write(uxplay_content)
+
 print(f"Patched {cmake_path}")

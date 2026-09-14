@@ -24,6 +24,9 @@ class SettingsTests(unittest.TestCase):
 
 
 class ModeTests(unittest.TestCase):
+    def test_application_version_is_semver(self):
+        self.assertRegex(core.APP_VERSION, r"^\d+\.\d+\.\d+$")
+
     def test_profiles_have_explicit_wasapi_sink(self):
         for mode in ("stable", "balanced", "lowLatency"):
             args = core.mode_arguments(mode)

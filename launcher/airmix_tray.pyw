@@ -290,7 +290,7 @@ def start_uxplay():
     intentional_stop = False
     if log_writer is None:
         log_writer = create_log_writer()
-    log_writer.info(f"\n=== AirMix PC {datetime.datetime.now().astimezone().isoformat(timespec='seconds')} ===")
+    log_writer.info(f"\n=== {core.APP_NAME} v{core.APP_VERSION} {datetime.datetime.now().astimezone().isoformat(timespec='seconds')} ===")
     env = os.environ.copy()
     env["GST_PLUGIN_PATH"] = GST_PLUGIN_PATH
     env["PATH"] = SCRIPT_DIR + os.pathsep + env.get("PATH", "")
@@ -567,7 +567,7 @@ class AirMixWindow:
     def __init__(self, icon):
         self.icon = icon
         self.root = tk.Tk()
-        self.root.title(core.APP_NAME)
+        self.root.title(f"{core.APP_NAME} v{core.APP_VERSION}")
         self.root.geometry("720x590")
         self.root.minsize(620, 520)
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
@@ -604,6 +604,7 @@ class AirMixWindow:
         top.pack(fill="x")
         ttk.Label(top, text="AirMix PC", style="Header.TLabel").pack(side="left")
         ttk.Label(top, text="iPhone + Windows audio over Wi-Fi", style="Sub.TLabel").pack(side="left", padx=(14, 0), pady=(12, 0))
+        ttk.Label(top, text=f"v{core.APP_VERSION}", style="Sub.TLabel").pack(side="right", pady=(12, 0))
 
         status = ttk.Frame(body, style="Card.TFrame", padding=18)
         status.pack(fill="x", pady=(20, 10))
@@ -692,9 +693,10 @@ def run_tray():
     modes = pystray.Menu(*(pystray.MenuItem(core.MODE_LABELS[m], mode_handler(m), checked=mode_checked(m), radio=True)
                            for m in core.VALID_MODES))
     icon = AirMixTrayIcon(
-        "AirMixPC", create_icon_image(), f"{core.APP_NAME} ({settings['receiverName']})",
+        "AirMixPC", create_icon_image(), f"{core.APP_NAME} v{core.APP_VERSION} ({settings['receiverName']})",
         menu=pystray.Menu(
             pystray.MenuItem("Open AirMix PC", lambda icon, item: main_window.show(), default=True),
+            pystray.MenuItem(f"Version {core.APP_VERSION}", None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(host_text, None, enabled=False),
             pystray.MenuItem(client_text, None, enabled=False),

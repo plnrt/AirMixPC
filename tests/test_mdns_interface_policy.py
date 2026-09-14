@@ -20,6 +20,14 @@ class MdnsInterfacePolicyTests(unittest.TestCase):
     def test_vpn_friendly_all_interface_comment_was_removed(self):
         self.assertNotIn("raising a VPN is picked up", SOURCE)
 
+    def test_services_are_periodically_reannounced(self):
+        self.assertIn("#define ANNOUNCE_REFRESH_INTERVAL_S 30", SOURCE)
+        self.assertIn(
+            "difftime(now, last_announcement) >= ANNOUNCE_REFRESH_INTERVAL_S",
+            SOURCE,
+        )
+        self.assertIn("announce_active_services(dnssd);", SOURCE)
+
 
 if __name__ == "__main__":
     unittest.main()

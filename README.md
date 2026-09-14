@@ -17,7 +17,7 @@ and marks the known `admin_new` and `admin_new_5g` profiles Private.
 
 Build from an MSYS2 MinGW64 shell with `./build.sh`, then compile the normal
 Windows installer with `installer\build-installer.ps1`. Run
-`dist\installer\AirMixPC-Setup-1.0.1.exe` to install. The modern wizard offers
+`dist\installer\AirMixPC-Setup-1.0.2.exe` to install. The modern wizard offers
 Ukrainian and English UI, startup and desktop-shortcut choices, and caches a
 repair launcher in the Start menu. Windows Installed Apps provides normal
 uninstall. Uninstall does not touch Bluetooth Audio Receiver, Phone Link, or

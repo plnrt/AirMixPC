@@ -60,6 +60,7 @@
 /* Announcement repeat count and interval (ms) */
 #define ANNOUNCE_COUNT  3
 #define ANNOUNCE_INTERVAL_MS 250
+#define ANNOUNCE_REFRESH_INTERVAL_S 30
 
 /* Use the record's normal TTL rather than an explicit override. */
 #define TTL_USE_DEFAULT (-1)
@@ -940,6 +941,7 @@ static THREAD_RETVAL mdns_thread_func(void *arg)
     dnssd_t *dnssd = (dnssd_t *)arg;
     uint8_t buf[MDNS_BUF_SIZE];
     time_t last_iface_refresh = time(NULL);
+    time_t last_announcement = last_iface_refresh;
 
     while (dnssd->mdns_running) {
         fd_set fds;
@@ -961,6 +963,16 @@ static THREAD_RETVAL mdns_thread_func(void *arg)
             if (refresh_interfaces(dnssd) > 0) {
                 announce_active_services(dnssd);
             }
+        }
+
+        /* Windows permits several mDNS consumers to share UDP 5353, but an
+         * incoming browse query is not reliably delivered to every socket.
+         * Periodic unsolicited announcements keep the receiver discoverable
+         * even when another local mDNS consumer receives the iPhone's query. */
+        if (now < last_announcement ||
+            difftime(now, last_announcement) >= ANNOUNCE_REFRESH_INTERVAL_S) {
+            last_announcement = now;
+            announce_active_services(dnssd);
         }
 
         if (ret <= 0) continue;

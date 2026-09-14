@@ -12,6 +12,7 @@ import time
 
 
 APP_NAME = "AirMix PC"
+APP_VERSION = "1.0.2"
 APP_SLUG = "AirMixPC"
 DEFAULT_SETTINGS = {
     "receiverName": APP_NAME,

@@ -197,14 +197,24 @@ def apply_log_line(state, line):
         kind, payload = telemetry
         if kind == "metric":
             state["metrics"] = payload
+        elif "start" in payload:
+            # A fresh start for this session means it is no longer in error,
+            # even if another session's error/disconnect had set this flag.
+            state["audio_error"] = False
         elif payload.get("reason") in {"network", "audio_error", "unexpected"}:
             state["audio_error"] = True
         return state
     if event == "audio session ended":
-        client, output, mode = state["client"], state["output"], state["effective_mode"]
-        state.update(new_state())
-        state.update(client=client, output=output, effective_mode=mode)
-        auto_policy.reset_session()
+        # The per-sid AIRMIX_EVENT disconnect line (handled above, via
+        # sessions.apply in handle_output_line) always precedes this legacy
+        # text line, so the registry already reflects any other session that
+        # is still connected. Only collapse the aggregated single-session
+        # view (and drop the Auto baseline) once no session remains.
+        if sessions.count() == 0:
+            client, output, mode = state["client"], state["output"], state["effective_mode"]
+            state.update(new_state())
+            state.update(client=client, output=output, effective_mode=mode)
+            auto_policy.reset_session()
         return state
     if event == "audio session started":
         client, output, mode = state["client"], state["output"], state["effective_mode"]
@@ -264,7 +274,14 @@ def handle_output_line(line):
     with state_lock:
         apply_log_line(session_state, line)
         if telemetry:
-            sessions.apply(telemetry[0], telemetry[1])
+            kind, payload = telemetry
+            sessions.apply(kind, payload)
+            if kind == "event" and "disconnect" in payload:
+                sid = core.session_id(payload)
+                if sid > 0:
+                    # Only this session's Auto baseline is stale; other
+                    # connected sessions keep tracking their own.
+                    auto_policy.reset_session(sid)
         if settings["mode"] == "auto" and telemetry:
             kind, payload = telemetry
             if kind == "metric":
@@ -330,6 +347,7 @@ def stop_uxplay():
         current, process = process, None
         reader, reader_thread = reader_thread, None
         signal, shutdown_signal = shutdown_signal, None
+        sessions.clear()
     if current and current.poll() is None:
         try:
             if signal:

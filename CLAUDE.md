@@ -157,14 +157,17 @@ suite passed 26 tests, with 2 optional live shutdown tests skipped unless a
 built package is supplied. The local installer was built as
 `AirMixPC-Setup-1.0.2.exe`; it has not yet been published as a GitHub release.
 
-Version 1.1.0 (multi-session audio, `-maxclients`) has been built locally only:
-`./build.sh` completed and verified 164 PE files (162 DLLs, 2 EXEs), and
+Version 1.1.0 (multi-session audio, `-maxclients`) is installed and live-tested:
+`./build.sh` verified 164 PE files (162 DLLs, 2 EXEs), and
 `python -m unittest discover -s tests -v` passed 74 tests (2 skipped, the same
-optional live-shutdown tests as above). 1.1.0 has **not** been installed to
-`D:\AirMixPC` or anywhere else, and no live test with a real iPhone and iPad
-connected at the same time has been run. Do not treat multi-device behavior,
-per-session telemetry, or admission/disconnect handling as confirmed on real
-hardware until that live test happens and the user reports back.
+optional live-shutdown tests as above). The installer was compiled with Inno
+Setup 6.7.3 as `dist\installer\AirMixPC-Setup-1.1.0.exe` and applied silently
+to `D:\AirMixPC` on 2026-09-14 (registry DisplayVersion 1.1.0; installed
+`AirMixPC.exe`/`uxplay.exe` hashes match the package; `receiver.pem`,
+`settings.json` and `trusted-devices.register` were preserved, and
+`settings.json` gained `maxClients: 4`). The user confirmed on real hardware
+that an iPhone and an iPad connect to `AirMix PC` and play at the same time.
+The 1.1.0 installer has not been published as a GitHub release.
 
 Known cosmetic limitation carried from the WP-B implementation: metadata-text
 deduplication (`launcher`/core console output that suppresses repeated,

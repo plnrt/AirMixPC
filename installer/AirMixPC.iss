@@ -1,5 +1,5 @@
 #define AppName "AirMix PC"
-#define AppVersion "1.0.0"
+#define AppVersion "1.0.1"
 #define AppPublisher "AirMix PC contributors"
 #define AppExeName "AirMixPC.exe"
 

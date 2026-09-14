@@ -63,7 +63,7 @@ New-Link (Join-Path $startup 'AirMix PC.lnk') $exe $installDir
 $uninstallKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AirMixPC'
 New-Item -Force $uninstallKey | Out-Null
 Set-ItemProperty $uninstallKey DisplayName $appName
-Set-ItemProperty $uninstallKey DisplayVersion '1.0.0'
+Set-ItemProperty $uninstallKey DisplayVersion '1.0.1'
 Set-ItemProperty $uninstallKey Publisher 'AirMix PC contributors'
 Set-ItemProperty $uninstallKey InstallLocation $installDir
 Set-ItemProperty $uninstallKey UninstallString ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $installDir 'AirMixPC-Uninstall.ps1'))

@@ -65,7 +65,7 @@
 #define TTL_USE_DEFAULT (-1)
 
 /* Interfaces the responder will advertise on, and how often the list is
- * rechecked so that joining Wi-Fi, docking, or raising a VPN is picked up. */
+ * rechecked so that joining Wi-Fi or docking is picked up. */
 #define MAX_MDNS_IFACES 16
 #define IFACE_REFRESH_INTERVAL_S 15
 
@@ -535,14 +535,31 @@ static uint32_t get_local_ip(void)
 }
 
 /**
- * Collect every usable local IPv4 address.
+ * Collect IPv4 addresses that belong to a real routed LAN.
  *
- * get_local_ip() alone is not enough: it reports only the interface that
- * happens to route toward the internet, so a multi-homed PC advertised on the
- * wrong link, a VPN could hide the LAN, and a machine with no default route
- * got nothing at all. Returns the number of addresses written.
+ * Windows TAP/VPN adapters commonly report themselves as ordinary Ethernet
+ * adapters, so interface type alone is not enough to exclude them. Requiring
+ * an IPv4 gateway keeps AirPlay discovery on the home Ethernet/Wi-Fi network
+ * and prevents the same .local host and service records from being advertised
+ * into an unrelated tunnel. Returns the number of addresses written.
  */
 static int iface_listed(const uint32_t *list, int count, uint32_t ip);
+
+#ifdef WIN32
+static int adapter_has_ipv4_gateway(const IP_ADAPTER_ADDRESSES *adapter)
+{
+    const IP_ADAPTER_GATEWAY_ADDRESS_LH *gateway;
+
+    for (gateway = adapter->FirstGatewayAddress; gateway; gateway = gateway->Next) {
+        const struct sockaddr_in *addr;
+        if (!gateway->Address.lpSockaddr ||
+            gateway->Address.lpSockaddr->sa_family != AF_INET) continue;
+        addr = (const struct sockaddr_in *)gateway->Address.lpSockaddr;
+        if (addr->sin_addr.s_addr != 0) return 1;
+    }
+    return 0;
+}
+#endif
 
 static int enumerate_local_ipv4(uint32_t *out, int max_count)
 {
@@ -564,7 +581,7 @@ static int enumerate_local_ipv4(uint32_t *out, int max_count)
         adapters = resized;
         result = GetAdaptersAddresses(AF_INET,
                                       GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-                                      GAA_FLAG_SKIP_DNS_SERVER,
+                                      GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_INCLUDE_GATEWAYS,
                                       NULL, adapters, &size);
     }
 
@@ -577,7 +594,9 @@ static int enumerate_local_ipv4(uint32_t *out, int max_count)
          adapter && count < max_count; adapter = adapter->Next) {
         if (adapter->OperStatus != IfOperStatusUp) continue;
         if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        if (adapter->IfType == IF_TYPE_PPP || adapter->IfType == IF_TYPE_TUNNEL) continue;
         if (adapter->Flags & IP_ADAPTER_NO_MULTICAST) continue;
+        if (!adapter_has_ipv4_gateway(adapter)) continue;
         for (IP_ADAPTER_UNICAST_ADDRESS *unicast = adapter->FirstUnicastAddress;
              unicast && count < max_count; unicast = unicast->Next) {
             if (!unicast->Address.lpSockaddr ||

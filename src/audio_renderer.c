@@ -202,11 +202,55 @@ static audio_session_t *find_session_locked(void *cls) {
     return NULL;
 }
 
-/* Stops playback and releases every GStreamer object owned by the session,
- * but leaves the session_t itself (and its place in the list, if any)
- * intact so it can be immediately rebuilt for a new codec. The bus watch
- * is always removed before the bus is unreffed. */
-static void teardown_pipeline(audio_session_t *session) {
+/* Holds a session's GStreamer objects (and, when discarding the session
+ * outright, the session_t itself) while their release is deferred to the
+ * GMainContext the bus watch dispatches in. See teardown_pipeline_locked(). */
+typedef struct {
+    GstBus *bus;
+    GstElement *volume;
+    GstElement *appsrc;
+    GstElement *pipeline;
+    audio_session_t *session;
+} audio_session_free_ctx_t;
+
+static gboolean audio_session_free_idle(gpointer user_data) {
+    audio_session_free_ctx_t *ctx = (audio_session_free_ctx_t *) user_data;
+    if (ctx->bus) {
+        gst_object_unref(ctx->bus);
+    }
+    if (ctx->volume) {
+        gst_object_unref(ctx->volume);
+    }
+    if (ctx->appsrc) {
+        gst_object_unref(ctx->appsrc);
+    }
+    if (ctx->pipeline) {
+        gst_object_unref(ctx->pipeline);
+    }
+    if (ctx->session) {
+        g_free(ctx->session);
+    }
+    g_free(ctx);
+    return G_SOURCE_REMOVE;
+}
+
+/* Stops playback and releases every GStreamer object owned by the session;
+ * when free_session is non-NULL (always the same pointer as session, used
+ * by callers that are discarding the session itself rather than rebuilding
+ * its pipeline for a new codec) that struct is freed too. Must be called
+ * with sessions_mutex held, and the caller must not release the mutex
+ * between removing the session from the list (if applicable) and calling
+ * this, so no other thread can observe a half-torn-down session.
+ *
+ * The bus watch is removed synchronously (so no further bus callback will
+ * be dispatched for this session), but the actual gst_object_unref() calls
+ * and the session_t free are posted via g_idle_add() to the same
+ * GMainContext the bus watch used: since that context is only ever iterated
+ * by the main-loop thread, this serializes the release after any bus
+ * callback for this session that was already dispatching when the watch was
+ * removed. If the main loop isn't running (g_loop == NULL) there is nothing
+ * to serialize against, and everything is released immediately. */
+static void teardown_pipeline_locked(audio_session_t *session, audio_session_t *free_session) {
     if (session->bus_watch_id) {
         g_source_remove(session->bus_watch_id);
         session->bus_watch_id = 0;
@@ -217,27 +261,52 @@ static void teardown_pipeline(audio_session_t *session) {
         }
         gst_element_set_state(session->pipeline, GST_STATE_NULL);
     }
-    if (session->bus) {
-        gst_object_unref(session->bus);
-        session->bus = NULL;
-    }
-    if (session->volume) {
-        gst_object_unref(session->volume);
-        session->volume = NULL;
-    }
-    if (session->appsrc) {
-        gst_object_unref(session->appsrc);
-        session->appsrc = NULL;
-    }
-    if (session->pipeline) {
-        gst_object_unref(session->pipeline);
-        session->pipeline = NULL;
-    }
     session->render_audio = FALSE;
+
+    GstBus *bus = session->bus;
+    GstElement *volume = session->volume;
+    GstElement *appsrc = session->appsrc;
+    GstElement *pipeline = session->pipeline;
+    session->bus = NULL;
+    session->volume = NULL;
+    session->appsrc = NULL;
+    session->pipeline = NULL;
+
+    if (!g_loop) {
+        if (bus) {
+            gst_object_unref(bus);
+        }
+        if (volume) {
+            gst_object_unref(volume);
+        }
+        if (appsrc) {
+            gst_object_unref(appsrc);
+        }
+        if (pipeline) {
+            gst_object_unref(pipeline);
+        }
+        if (free_session) {
+            g_free(free_session);
+        }
+        return;
+    }
+
+    audio_session_free_ctx_t *ctx = g_new0(audio_session_free_ctx_t, 1);
+    ctx->bus = bus;
+    ctx->volume = volume;
+    ctx->appsrc = appsrc;
+    ctx->pipeline = pipeline;
+    ctx->session = free_session;
+    g_idle_add(audio_session_free_idle, ctx);
 }
 
 static gboolean gstreamer_audio_pipeline_bus_callback(GstBus *bus, GstMessage *message, gpointer user_data) {
     audio_session_t *session = (audio_session_t *) user_data;
+    if (!session->pipeline) {
+        /* Already stopped (destroy_session/rebuild ran on the httpd thread
+         * while this callback was queued); nothing left to do. */
+        return TRUE;
+    }
     switch (GST_MESSAGE_TYPE(message)) {
     case GST_MESSAGE_ERROR: {
         GError *err = NULL;
@@ -377,7 +446,19 @@ void audio_renderer_init(logger_t *render_logger, const char *audiosink, const b
 }
 
 void audio_renderer_set_loop(void *loop) {
+    g_mutex_lock(&sessions_mutex);
     g_loop = loop;
+    if (g_loop) {
+        /* Cheap insurance against the narrow window where a session's
+         * pipeline was built (audio_get_format ran on the httpd thread)
+         * before main_loop() called this: give it the bus watch it missed. */
+        for (audio_session_t *session = sessions; session; session = session->next) {
+            if (session->pipeline && !session->bus_watch_id) {
+                session->bus_watch_id = gst_bus_add_watch(session->bus, (GstBusFunc) gstreamer_audio_pipeline_bus_callback, session);
+            }
+        }
+    }
+    g_mutex_unlock(&sessions_mutex);
 }
 
 void audio_renderer_set_multi_session(bool enabled) {
@@ -404,9 +485,9 @@ void audio_renderer_start(void *cls, unsigned int sid, unsigned char *ct) {
     }
     session->sid = sid;
 
-    if (session->pipeline && session->ct != compression_type) {
+    if (session->pipeline && (session->ct != compression_type || !session->render_audio)) {
         logger_log(logger, LOGGER_INFO, "changed audio connection (sid=%u), format %s", sid, format_name(compression_type));
-        teardown_pipeline(session);
+        teardown_pipeline_locked(session, NULL);
     }
     if (!session->pipeline) {
         logger_log(logger, LOGGER_INFO, "start audio connection (sid=%u), format %s", sid, format_name(compression_type));
@@ -447,20 +528,19 @@ void audio_renderer_destroy_session(void *cls) {
         prev = session;
         session = session->next;
     }
-    if (session) {
-        if (prev) {
-            prev->next = session->next;
-        } else {
-            sessions = session->next;
-        }
-    }
-    g_mutex_unlock(&sessions_mutex);
-
     if (!session) {
+        g_mutex_unlock(&sessions_mutex);
         return;
     }
-    teardown_pipeline(session);
-    g_free(session);
+    if (prev) {
+        prev->next = session->next;
+    } else {
+        sessions = session->next;
+    }
+    /* Unlink and stop stay under the same lock acquisition: no window where
+     * another thread could look this session up mid-teardown. */
+    teardown_pipeline_locked(session, session);
+    g_mutex_unlock(&sessions_mutex);
 }
 
 void audio_renderer_render_buffer(void *cls, unsigned char *data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time) {
@@ -475,8 +555,12 @@ void audio_renderer_render_buffer(void *cls, unsigned char *data, int *data_len,
     unsigned int sid = 0;
     gboolean sync = FALSE;
     GstClockTime base_time = 0;
-    if (session && session->render_audio) {
-        appsrc = session->appsrc;
+    if (session && session->render_audio && session->appsrc) {
+        /* Referenced while still under the lock: a concurrent codec change
+         * (audio_renderer_start, on the httpd thread) may teardown/rebuild
+         * this session's pipeline as soon as the lock is released, and the
+         * push below must not touch a freed appsrc. */
+        appsrc = GST_ELEMENT(gst_object_ref(session->appsrc));
         ct = session->ct;
         sid = session->sid;
         sync = session->sync;
@@ -495,6 +579,7 @@ void audio_renderer_render_buffer(void *cls, unsigned char *data, int *data_len,
         } else {
             logger_log(logger, LOGGER_ERR, "*** invalid ntp_time < base_time (sid=%u)\n%8.6f ntp_time\n%8.6f base_time",
                        sid, ((double) *ntp_time) / SECOND_IN_NSECS, ((double) base_time) / SECOND_IN_NSECS);
+            gst_object_unref(appsrc);
             return;
         }
     }
@@ -540,8 +625,15 @@ void audio_renderer_render_buffer(void *cls, unsigned char *data, int *data_len,
         break;
     }
     if (valid) {
-        gst_app_src_push_buffer(GST_APP_SRC(appsrc), buffer);
+        GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), buffer);
+        if (ret != GST_FLOW_OK) {
+            /* Pushing into a pipeline that just moved out of PLAYING (e.g. a
+             * concurrent teardown/rebuild) normally yields GST_FLOW_FLUSHING;
+             * that is expected, not an error worth escalating. */
+            logger_log(logger, LOGGER_DEBUG, "gst_app_src_push_buffer (sid=%u) returned %d", sid, (int) ret);
+        }
     } else {
+        gst_buffer_unref(buffer);
         logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", ct);
         if (!multi_session) {
             logger_log(logger, LOGGER_INFO, "AIRMIX_EVENT error sid=%u type=decoder reason=audio_error count=1", sid);
@@ -550,6 +642,7 @@ void audio_renderer_render_buffer(void *cls, unsigned char *data, int *data_len,
         }
         logger_log(logger, LOGGER_ERR, "***       first byte of invalid frame was  0x%2.2x ", (unsigned int) data[0]);
     }
+    gst_object_unref(appsrc);
 }
 
 void audio_renderer_set_volume(void *cls, double volume) {
@@ -572,16 +665,18 @@ void audio_renderer_flush(void *cls) {
 
 void audio_renderer_destroy(void) {
     g_mutex_lock(&sessions_mutex);
+    /* Called once at process shutdown, after the main loop has already
+     * stopped: there is no bus callback left to serialize against, so
+     * every session can be released synchronously. */
+    g_loop = NULL;
     audio_session_t *session = sessions;
     sessions = NULL;
-    g_mutex_unlock(&sessions_mutex);
-
     while (session) {
         audio_session_t *next = session->next;
-        teardown_pipeline(session);
-        g_free(session);
+        teardown_pipeline_locked(session, session);
         session = next;
     }
+    g_mutex_unlock(&sessions_mutex);
 
     g_free(audiosink_pipeline);
     audiosink_pipeline = NULL;

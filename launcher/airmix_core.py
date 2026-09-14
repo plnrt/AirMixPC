@@ -158,6 +158,113 @@ def parse_telemetry(line: str) -> tuple[str, dict] | None:
 
 
 @dataclass
+class SessionState:
+    """One connected AirPlay client, as tracked from AIRMIX telemetry."""
+
+    sid: int
+    device: str = ""
+    model: str = ""
+    codec: str = ""
+    connected: bool = False
+    error: bool = False
+    metrics: dict = field(default_factory=dict)
+
+    def label(self) -> str:
+        return self.device or self.model or f"Session {self.sid}"
+
+
+class SessionRegistry:
+    """Tracks per-session AirPlay client state from AIRMIX telemetry lines."""
+
+    def __init__(self):
+        self._sessions: dict[int, SessionState] = {}
+
+    def apply(self, kind: str, payload: dict) -> SessionState | None:
+        if kind == "metric":
+            return self._apply_metric(payload)
+        if kind == "event":
+            return self._apply_event(payload)
+        return None
+
+    def _apply_metric(self, payload: dict) -> SessionState | None:
+        sid = session_id(payload)
+        if sid <= 0:
+            return None
+        state = self._sessions.get(sid)
+        if state is None:
+            state = SessionState(sid=sid, connected=True)
+            self._sessions[sid] = state
+        state.metrics = {key: value for key, value in payload.items() if key != "sid"}
+        return state
+
+    def _apply_event(self, payload: dict) -> SessionState | None:
+        sid = session_id(payload)
+        if "start" in payload:
+            if sid <= 0:
+                return None
+            state = self._sessions.get(sid)
+            if state is None:
+                state = SessionState(sid=sid)
+                self._sessions[sid] = state
+            state.device = decode_field(payload.get("device", ""))
+            state.model = decode_field(payload.get("model", ""))
+            state.codec = decode_field(payload.get("codec", ""))
+            state.connected = True
+            state.error = False
+            return state
+        if "error" in payload:
+            if sid <= 0:
+                return None
+            state = self._sessions.get(sid)
+            if state is None:
+                return None
+            state.error = True
+            return state
+        if "disconnect" in payload:
+            if sid <= 0:
+                self.clear()
+                return None
+            return self._sessions.pop(sid, None)
+        return None
+
+    def apply_line(self, line: str) -> SessionState | None:
+        telemetry = parse_telemetry(line)
+        if telemetry is None:
+            return None
+        kind, payload = telemetry
+        return self.apply(kind, payload)
+
+    def get(self, sid: int) -> SessionState | None:
+        return self._sessions.get(sid)
+
+    def active(self) -> list[SessionState]:
+        return [self._sessions[sid] for sid in sorted(self._sessions)]
+
+    def count(self) -> int:
+        return len(self._sessions)
+
+    def clear(self) -> None:
+        self._sessions.clear()
+
+    def lines(self) -> list[str]:
+        result = []
+        for state in self.active():
+            line = f"{state.label()} — {'Error' if state.error else 'Connected'}"
+            if state.codec:
+                line += f" ({state.codec})"
+            result.append(line)
+        return result
+
+    def summary(self) -> str:
+        labels = [state.label() for state in self.active()]
+        if not labels:
+            return "No devices"
+        if len(labels) == 1:
+            return labels[0]
+        return f"{len(labels)} devices: " + ", ".join(labels)
+
+
+@dataclass
 class AutoPolicy:
     """Escalate Auto mode once per session when transport is demonstrably poor."""
 

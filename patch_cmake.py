@@ -14,6 +14,11 @@ raop_rtp_path = os.path.join("lib", "uxplay", "lib", "raop_rtp.c")
 raop_buffer_path = os.path.join("lib", "uxplay", "lib", "raop_buffer.c")
 raop_buffer_header_path = os.path.join("lib", "uxplay", "lib", "raop_buffer.h")
 audio_renderer_path = os.path.join("lib", "uxplay", "renderers", "audio_renderer.c")
+raop_h_path = os.path.join("lib", "uxplay", "lib", "raop.h")
+raop_c_path = os.path.join("lib", "uxplay", "lib", "raop.c")
+httpd_h_path = os.path.join("lib", "uxplay", "lib", "httpd.h")
+httpd_c_path = os.path.join("lib", "uxplay", "lib", "httpd.c")
+raop_handlers_path = os.path.join("lib", "uxplay", "lib", "raop_handlers.h")
 
 with open(cmake_path, "r") as f:
     content = f.read()
@@ -481,5 +486,422 @@ if "audioresample quality=10 !" not in audio_renderer_content:
 
 with open(audio_renderer_path, "w") as f:
     f.write(audio_renderer_content)
+
+# 9. Multi-session admission control: per-connection session ids, a
+# connection-count admission check keyed off raop->max_raop_clients, and an
+# address-scoped disconnect API so one AirPlay session can be dropped without
+# tearing down the others. Default max_raop_clients = 1 keeps single-client
+# behavior identical to upstream.
+with open(raop_h_path, "r") as f:
+    raop_h_content = f.read()
+
+if "unsigned int session_id;" not in raop_h_content:
+    anchor = "struct raop_callbacks_s {\n    void* cls;\n"
+    if anchor not in raop_h_content:
+        raise RuntimeError("raop.h: could not find raop_callbacks_s cls field")
+    raop_h_content = raop_h_content.replace(anchor, anchor + "    unsigned int session_id;\n", 1)
+
+if "raop_connection_id" not in raop_h_content:
+    anchor = "RAOP_API void raop_destroy(raop_t *raop);\n"
+    if anchor not in raop_h_content:
+        raise RuntimeError("raop.h: could not find raop_destroy declaration")
+    raop_h_content = raop_h_content.replace(
+        anchor,
+        anchor
+        + "RAOP_API unsigned int raop_connection_id(void *connection);\n"
+        "RAOP_API void raop_disconnect_connection(raop_t *raop, void *connection);\n"
+        "RAOP_API void raop_set_max_clients(raop_t *raop, unsigned int max_clients);\n",
+        1,
+    )
+
+with open(raop_h_path, "w") as f:
+    f.write(raop_h_content)
+
+with open(raop_c_path, "r") as f:
+    raop_c_content = f.read()
+
+if "unsigned int session_counter;" not in raop_c_content:
+    anchor = "  /* used for setting HLS video language choices */\n    char *lang;\n};"
+    if anchor not in raop_c_content:
+        raise RuntimeError("raop.c: could not find end of raop_s struct")
+    raop_c_content = raop_c_content.replace(
+        anchor,
+        "  /* used for setting HLS video language choices */\n    char *lang;\n\n"
+        "    /* multi-session admission control (AirMix PC) */\n"
+        "    unsigned int session_counter;\n"
+        "    unsigned int max_raop_clients;\n};",
+        1,
+    )
+
+if "unsigned int session_id;" not in raop_c_content:
+    anchor = "    unsigned int zone_id;\n\n    connection_type_t connection_type; \n"
+    if anchor not in raop_c_content:
+        raise RuntimeError("raop.c: could not find raop_conn_s zone_id field")
+    raop_c_content = raop_c_content.replace(
+        anchor,
+        "    unsigned int zone_id;\n    unsigned int session_id;\n\n    connection_type_t connection_type; \n",
+        1,
+    )
+
+if "conn->session_id = ++raop->session_counter;" not in raop_c_content:
+    anchor = "    conn->zone_id = zone_id;\n"
+    if anchor not in raop_c_content:
+        raise RuntimeError("raop.c: could not find conn_init zone_id assignment")
+    raop_c_content = raop_c_content.replace(
+        anchor, anchor + "    conn->session_id = ++raop->session_counter;\n", 1
+    )
+    anchor = (
+        "    if (raop->callbacks.conn_init) {\n"
+        "        raop->callbacks.conn_init(raop->callbacks.cls);\n"
+        "    }"
+    )
+    if anchor not in raop_c_content:
+        raise RuntimeError("raop.c: could not find conn_init callback invocation")
+    raop_c_content = raop_c_content.replace(
+        anchor,
+        "    if (raop->callbacks.conn_init) {\n        raop->callbacks.conn_init(conn);\n    }",
+        1,
+    )
+
+if "raop->callbacks.conn_destroy(conn);" not in raop_c_content:
+    old_conn_destroy = """    if (raop->callbacks.conn_destroy) {
+        raop->callbacks.conn_destroy(raop->callbacks.cls);
+    }
+
+    if (conn->raop_rtp) {
+        /* This is done in case TEARDOWN was not called */
+        raop_rtp_destroy(conn->raop_rtp);
+    }
+    if (conn->raop_rtp_mirror) {
+        /* This is done in case TEARDOWN was not called */
+        raop_rtp_mirror_destroy(conn->raop_rtp_mirror);
+    }
+    if (conn->raop_ntp) {
+        raop_ntp_destroy(conn->raop_ntp);
+    }
+
+    if (raop->callbacks.video_flush) {
+        raop->callbacks.video_flush(raop->callbacks.cls);
+    }
+"""
+    new_conn_destroy = """    if (conn->raop_rtp) {
+        /* This is done in case TEARDOWN was not called */
+        raop_rtp_destroy(conn->raop_rtp);
+    }
+    if (conn->raop_rtp_mirror) {
+        /* This is done in case TEARDOWN was not called */
+        raop_rtp_mirror_destroy(conn->raop_rtp_mirror);
+    }
+    if (conn->raop_ntp) {
+        raop_ntp_destroy(conn->raop_ntp);
+    }
+
+    if (raop->callbacks.conn_destroy) {
+        raop->callbacks.conn_destroy(conn);
+    }
+
+    if (raop->callbacks.video_flush) {
+        raop->callbacks.video_flush(raop->callbacks.cls);
+    }
+"""
+    if old_conn_destroy not in raop_c_content:
+        raise RuntimeError("raop.c: could not find conn_destroy teardown sequence")
+    raop_c_content = raop_c_content.replace(old_conn_destroy, new_conn_destroy, 1)
+
+if "raop_connection_count >= (int) raop->max_raop_clients" not in raop_c_content:
+    old_admission = "            if (httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_RAOP)) {"
+    new_admission = (
+        "            int raop_connection_count = httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_RAOP);\n"
+        "            if (raop_connection_count >= (int) raop->max_raop_clients) {"
+    )
+    if old_admission not in raop_c_content:
+        raise RuntimeError("raop.c: could not find RAOP admission check")
+    raop_c_content = raop_c_content.replace(old_admission, new_admission, 1)
+
+if "raop->max_raop_clients = 1;" not in raop_c_content:
+    anchor = "    raop->hls_support = false;\n    raop->hls_pending = false;\n    \n    raop->nonce = NULL;"
+    if anchor not in raop_c_content:
+        raise RuntimeError("raop.c: could not find raop_init hls_pending initialization")
+    raop_c_content = raop_c_content.replace(
+        anchor,
+        "    raop->hls_support = false;\n    raop->hls_pending = false;\n\n"
+        "    raop->session_counter = 0;\n    raop->max_raop_clients = 1;\n    \n    raop->nonce = NULL;",
+        1,
+    )
+
+if "raop_connection_id(void *connection)" not in raop_c_content:
+    anchor = 'uint64_t get_local_time() {\n    return raop_ntp_get_local_time();\n}'
+    if anchor not in raop_c_content:
+        raise RuntimeError("raop.c: could not find get_local_time definition")
+    raop_c_content = raop_c_content.replace(
+        anchor,
+        """unsigned int raop_connection_id(void *connection) {
+    raop_conn_t *conn = (raop_conn_t *) connection;
+    if (!conn) {
+        return 0;
+    }
+    return conn->session_id;
+}
+
+void raop_disconnect_connection(raop_t *raop, void *connection) {
+    if (!raop || !connection) {
+        return;
+    }
+    httpd_remove_connection_by_user_data(raop->httpd, connection);
+}
+
+void raop_set_max_clients(raop_t *raop, unsigned int max_clients) {
+    assert(raop);
+    raop->max_raop_clients = (max_clients > 0) ? max_clients : 1;
+}
+
+"""
+        + anchor,
+        1,
+    )
+
+with open(raop_c_path, "w") as f:
+    f.write(raop_c_content)
+
+with open(httpd_h_path, "r") as f:
+    httpd_h_content = f.read()
+if "httpd_remove_connection_by_user_data" not in httpd_h_content:
+    anchor = "void httpd_remove_connections_by_type(httpd_t *httpd, connection_type_t type);\n"
+    if anchor not in httpd_h_content:
+        raise RuntimeError("httpd.h: could not find httpd_remove_connections_by_type declaration")
+    httpd_h_content = httpd_h_content.replace(
+        anchor, anchor + "void httpd_remove_connection_by_user_data(httpd_t *httpd, void *user_data);\n", 1
+    )
+with open(httpd_h_path, "w") as f:
+    f.write(httpd_h_content)
+
+with open(httpd_c_path, "r") as f:
+    httpd_c_content = f.read()
+if "httpd_remove_connection_by_user_data" not in httpd_c_content:
+    anchor = """void
+httpd_remove_connections_by_type(httpd_t *httpd, connection_type_t type) {
+    for (int i = 0; i < httpd->max_connections; i++) {
+        http_connection_t *connection = &httpd->connections[i];
+        if (!connection->connected || connection->type != type) {
+            continue;
+        }
+        connection->pending_remove = 1;
+    }
+}
+"""
+    if anchor not in httpd_c_content:
+        raise RuntimeError("httpd.c: could not find httpd_remove_connections_by_type")
+    httpd_c_content = httpd_c_content.replace(
+        anchor,
+        anchor
+        + """
+void
+httpd_remove_connection_by_user_data(httpd_t *httpd, void *user_data) {
+    for (int i = 0; i < httpd->max_connections; i++) {
+        http_connection_t *connection = &httpd->connections[i];
+        if (!connection->connected || connection->user_data != user_data) {
+            continue;
+        }
+        connection->pending_remove = 1;
+    }
+}
+""",
+        1,
+    )
+with open(httpd_c_path, "w") as f:
+    f.write(httpd_c_content)
+
+with open(raop_handlers_path, "r") as f:
+    raop_handlers_content = f.read()
+
+if "raop_callbacks_t conn_cbs = raop->callbacks;" not in raop_handlers_content:
+    old_init_calls = """        conn->raop_ntp = raop_ntp_init(raop->logger, &raop->callbacks, remote,
+                                       conn->remotelen, (unsigned short) timing_rport, &time_protocol);
+        raop_ntp_start(conn->raop_ntp, &timing_lport);
+        conn->raop_rtp = raop_rtp_init(raop->logger, &raop->callbacks, conn->raop_ntp,
+                                       remote, conn->remotelen, aeskey, aesiv);
+        conn->raop_rtp_mirror = raop_rtp_mirror_init(raop->logger, &raop->callbacks,
+                                                     conn->raop_ntp, remote, conn->remotelen, aeskey);
+"""
+    new_init_calls = """        raop_callbacks_t conn_cbs = raop->callbacks;
+        conn_cbs.cls = conn;
+        conn_cbs.session_id = conn->session_id;
+        conn->raop_ntp = raop_ntp_init(raop->logger, &conn_cbs, remote,
+                                       conn->remotelen, (unsigned short) timing_rport, &time_protocol);
+        raop_ntp_start(conn->raop_ntp, &timing_lport);
+        conn->raop_rtp = raop_rtp_init(raop->logger, &conn_cbs, conn->raop_ntp,
+                                       remote, conn->remotelen, aeskey, aesiv);
+        conn->raop_rtp_mirror = raop_rtp_mirror_init(raop->logger, &conn_cbs,
+                                                     conn->raop_ntp, remote, conn->remotelen, aeskey);
+"""
+    if old_init_calls not in raop_handlers_content:
+        raise RuntimeError("raop_handlers.h: could not find raop_ntp/raop_rtp/raop_rtp_mirror init calls")
+    raop_handlers_content = raop_handlers_content.replace(old_init_calls, new_init_calls, 1)
+
+if "raop->callbacks.report_client_request(conn," not in raop_handlers_content:
+    old = "raop->callbacks.report_client_request(raop->callbacks.cls, deviceID, model, name, &admit_client);"
+    new = "raop->callbacks.report_client_request(conn, deviceID, model, name, &admit_client);"
+    if old not in raop_handlers_content:
+        raise RuntimeError("raop_handlers.h: could not find report_client_request call")
+    raop_handlers_content = raop_handlers_content.replace(old, new, 1)
+
+if "raop->callbacks.audio_get_format(conn," not in raop_handlers_content:
+    old = "raop->callbacks.audio_get_format(raop->callbacks.cls, &ct, &spf, &usingScreen, &isMedia, &audioFormat);"
+    new = "raop->callbacks.audio_get_format(conn, &ct, &spf, &usingScreen, &isMedia, &audioFormat);"
+    if old not in raop_handlers_content:
+        raise RuntimeError("raop_handlers.h: could not find audio_get_format call")
+    raop_handlers_content = raop_handlers_content.replace(old, new, 1)
+
+if "raop->callbacks.conn_feedback(conn);" not in raop_handlers_content:
+    old = "raop->callbacks.conn_feedback(raop->callbacks.cls);"
+    new = "raop->callbacks.conn_feedback(conn);"
+    if old not in raop_handlers_content:
+        raise RuntimeError("raop_handlers.h: could not find conn_feedback call")
+    raop_handlers_content = raop_handlers_content.replace(old, new, 1)
+
+if "raop->callbacks.audio_stop_coverart_rendering(conn);" not in raop_handlers_content:
+    old = "raop->callbacks.audio_stop_coverart_rendering(raop->callbacks.cls);"
+    new = "raop->callbacks.audio_stop_coverart_rendering(conn);"
+    if old not in raop_handlers_content:
+        raise RuntimeError("raop_handlers.h: could not find audio_stop_coverart_rendering call")
+    raop_handlers_content = raop_handlers_content.replace(old, new, 1)
+
+with open(raop_handlers_path, "w") as f:
+    f.write(raop_handlers_content)
+
+# Move the raop_rtp_thread_udp tail's "running = false" transition to after
+# the final AIRMIX_METRIC/disconnect/session-ended log lines, so those logs
+# (and a future sid tag) are emitted while the connection is still considered
+# running, matching the pre-teardown state raop_disconnect_connection expects.
+with open(raop_rtp_path, "r") as f:
+    raop_rtp_content = f.read()
+
+if 'audio session ended");\n\n    // Ensure running reflects the actual state' not in raop_rtp_content:
+    old_tail = """    // Ensure running reflects the actual state
+    MUTEX_LOCK(raop_rtp->run_mutex);
+    raop_rtp->running = false;
+    MUTEX_UNLOCK(raop_rtp->run_mutex);
+
+    raop_buffer_stats_t airmix_stats;
+    raop_buffer_get_stats(raop_rtp->buffer, &airmix_stats);
+    logger_log(raop_rtp->logger, LOGGER_INFO,
+               "AIRMIX_METRIC received=%llu missing=%llu retransmitted=%llu late=%llu flushes=%llu decoder_errors=0 sink_errors=0",
+               (unsigned long long) airmix_stats.received,
+               (unsigned long long) airmix_stats.missing,
+               (unsigned long long) airmix_retransmitted,
+               (unsigned long long) airmix_stats.late,
+               (unsigned long long) airmix_stats.flushes);
+    logger_log(raop_rtp->logger, LOGGER_INFO, "AIRMIX_EVENT disconnect reason=ended");
+    logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp exiting thread");
+    logger_log(raop_rtp->logger, LOGGER_INFO, "audio session ended");
+
+    return 0;
+}"""
+    new_tail = """    raop_buffer_stats_t airmix_stats;
+    raop_buffer_get_stats(raop_rtp->buffer, &airmix_stats);
+    logger_log(raop_rtp->logger, LOGGER_INFO,
+               "AIRMIX_METRIC received=%llu missing=%llu retransmitted=%llu late=%llu flushes=%llu decoder_errors=0 sink_errors=0",
+               (unsigned long long) airmix_stats.received,
+               (unsigned long long) airmix_stats.missing,
+               (unsigned long long) airmix_retransmitted,
+               (unsigned long long) airmix_stats.late,
+               (unsigned long long) airmix_stats.flushes);
+    logger_log(raop_rtp->logger, LOGGER_INFO, "AIRMIX_EVENT disconnect reason=ended");
+    logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp exiting thread");
+    logger_log(raop_rtp->logger, LOGGER_INFO, "audio session ended");
+
+    // Ensure running reflects the actual state
+    MUTEX_LOCK(raop_rtp->run_mutex);
+    raop_rtp->running = false;
+    MUTEX_UNLOCK(raop_rtp->run_mutex);
+
+    return 0;
+}"""
+    if old_tail not in raop_rtp_content:
+        raise RuntimeError("raop_rtp.c: could not find raop_rtp_thread_udp tail to reorder")
+    raop_rtp_content = raop_rtp_content.replace(old_tail, new_tail, 1)
+
+with open(raop_rtp_path, "w") as f:
+    f.write(raop_rtp_content)
+
+# uxplay.cpp: -maxclients option, audio-only admission clamp, and wiring the
+# parsed limit into raop via raop_set_max_clients before the httpd starts.
+with open(uxplay_path, "r") as f:
+    uxplay_content = f.read()
+
+if "static unsigned int max_clients = 1;" not in uxplay_content:
+    anchor = "static int nohold = 0;\n"
+    if anchor not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find nohold global")
+    uxplay_content = uxplay_content.replace(anchor, anchor + "static unsigned int max_clients = 1;\n", 1)
+
+if 'printf("-maxclients' not in uxplay_content:
+    anchor = 'printf("-no-progress Suppress the once-per-second audio progress display.\\n");\n'
+    if anchor not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find -no-progress help insertion point")
+    uxplay_content = uxplay_content.replace(
+        anchor,
+        anchor
+        + '    printf("-maxclients n Allow up to n simultaneous AirPlay audio clients"\n'
+        '           " (default 1, max 12; audio-only, forced to 1 if video is enabled)\\n");\n',
+        1,
+    )
+
+if 'arg == "-maxclients"' not in uxplay_content:
+    anchor = '        } else if (arg == "-nohold") {\n            nohold = 1;\n'
+    if anchor not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find -nohold option parsing")
+    uxplay_content = uxplay_content.replace(
+        anchor,
+        anchor
+        + '        } else if (arg == "-maxclients") {\n'
+        '            unsigned int n = 12;\n'
+        '            if (!get_value(argv[++i], &n)) {\n'
+        '                fprintf(stderr, "invalid \\"-maxclients %s\\"; -maxclients n : range [1,12]\\n", argv[i]);\n'
+        '                exit(1);\n'
+        '            }\n'
+        '            max_clients = n;\n',
+        1,
+    )
+
+if "-maxclients is audio-only" not in uxplay_content:
+    anchor = """    if (videosink == "0") {
+        use_video = false;
+	videosink.erase();
+        videosink.append("fakesink");
+	videosink_options.erase();
+	LOGI("video_disabled");
+        display[3] = 1; /* set fps to 1 frame per sec when no video will be shown */
+    }
+"""
+    if anchor not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find use_video assignment to anchor the audio-only admission clamp")
+    uxplay_content = uxplay_content.replace(
+        anchor,
+        anchor
+        + """
+    if (max_clients > 1 && use_video) {
+        LOGI("-maxclients is audio-only (-vs 0); forcing 1");
+        max_clients = 1;
+    }
+    if (max_clients < 1) {
+        max_clients = 1;
+    } else if (max_clients > 12) {
+        max_clients = 12;
+    }
+""",
+        1,
+    )
+
+if "raop_set_max_clients(raop, max_clients);" not in uxplay_content:
+    anchor = "    raop_set_log_callback(raop, log_callback, NULL);\n    raop_set_log_level(raop, log_level);\n"
+    if anchor not in uxplay_content:
+        raise RuntimeError("uxplay.cpp: could not find raop_set_log_level call in start_raop_server")
+    uxplay_content = uxplay_content.replace(
+        anchor, anchor + "    raop_set_max_clients(raop, max_clients);\n", 1
+    )
+
+with open(uxplay_path, "w") as f:
+    f.write(uxplay_content)
 
 print(f"Patched {cmake_path}")
